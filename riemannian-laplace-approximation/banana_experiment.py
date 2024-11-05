@@ -9,12 +9,20 @@ import matplotlib
 import matplotlib.pyplot as plt
 import sys
 import sklearn.model_selection
+import jax
+import jax.numpy as jnp
+import jax.random as jrandom
+
+import flax.linen as nn
+from flax import struct
+from flax.training import train_state
+import optax
 
 from laplace import Laplace
 import matplotlib.colors as colors
 import seaborn as sns
 import geomai.utils.geometry as geometry
-from torch import nn
+#from torch import nn
 from manifold import cross_entropy_manifold, linearized_cross_entropy_manifold
 from torch.distributions import MultivariateNormal
 from tqdm import tqdm
@@ -28,11 +36,11 @@ from functorch import grad, jvp, make_functional, vjp, make_functional_with_buff
 from functorch_utils import get_params_structure, stack_gradient, custum_hvp, stack_gradient2
 import os
 
+jax.config.update('jax_enable_x64', True)
 
 def main(args):
-    # sns.set_style('darkgrid')
     palette = sns.color_palette("colorblind")
-    print("Linearizatin?")
+    print("Linearization?")
     print(args.linearized_pred)
     subset_of_weights = args.subset  #'last_layer' # either 'last_layer' or 'all'
     hessian_structure = args.structure  #'full' # other possibility is 'diag' or 'full'
@@ -46,7 +54,7 @@ def main(args):
 
     # run with several seeds
     seed = args.seed
-    np.random.seed(seed)
+    jrandom.PRNGKey(seed)
     torch.manual_seed(seed)
     print("Seed: ", seed)
 
@@ -54,13 +62,14 @@ def main(args):
     # now I have to laod the banana dataset
     filen = os.path.join("data", "banana", "banana.csv")
     Xy = np.loadtxt(filen, delimiter=",")
+    Xy = jnp.asarray(Xy)
     x_train, y_train = Xy[:, :-1], Xy[:, -1]
     x_test, y_test = Xy[:0, :-1], Xy[:0, -1]
     y_train, y_test = y_train - 1, y_test - 1
 
     split_train_size = 0.7
     strat = None
-    x_full, y_full = np.concatenate((x_train, x_test)), np.concatenate((y_train, y_test))
+    x_full, y_full = jnp.concatenate((x_train, x_test)), jnp.concatenate((y_train, y_test))
     x_train, x_test, y_train, y_test = sklearn.model_selection.train_test_split(
         x_full, y_full, train_size=split_train_size, random_state=230, shuffle=shuffle, stratify=strat
     )
@@ -90,76 +99,146 @@ def main(args):
 
     # now I can transform them into dataaset and dataloader
     # I have to transform everything to tensor
-    x_train = torch.from_numpy(x_train).float()
-    x_valid = torch.from_numpy(x_valid).float()
-    x_test = torch.from_numpy(x_test).float()
+    ## This will be super inefficient, comeback and fix it!!
+##    x_train = torch.from_numpy(np.copy(np.asarray(x_train))).float()
+    x_train = x_train.astype(jnp.float32)
+##    x_valid = torch.from_numpy(np.copy(np.asarray(x_valid))).float()
+    x_valid = x_valid.astype(jnp.float32)
+##    x_test = torch.from_numpy(np.copy(np.asarray(x_test))).float()
+    x_test = x_test.astype(jnp.float32)
 
-    y_train = torch.from_numpy(y_train).long().reshape(-1)
-    y_valid = torch.from_numpy(y_valid).long().reshape(-1)
-    y_test = torch.from_numpy(y_test).long().reshape(-1)
+##    y_train = torch.from_numpy(np.copy(np.asarray(y_train))).long().reshape(-1)
+    y_train = y_train.astype(jnp.float32)
+##    y_valid = torch.from_numpy(np.copy(np.asarray(y_valid))).long().reshape(-1)
+    y_valid = y_valid.astype(jnp.float32)
+##    y_test = torch.from_numpy(np.copy(np.asarray(y_test))).long().reshape(-1)
+    y_test = y_test.astype(jnp.float32)
 
-    train_dataset = torch.utils.data.TensorDataset(x_train, y_train)
-    valid_dataset = torch.utils.data.TensorDataset(x_valid, y_valid)
-    test_dataset = torch.utils.data.TensorDataset(x_test, y_test)
+    @struct.dataclass
+    class Dataset:
+        features: jnp.ndarray
+        labels: jnp.ndarray
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=265, shuffle=True)
-    valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=50, shuffle=False)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=50, shuffle=False)
+    train_dataset = Dataset(x_train, y_train)
+    valid_dataset = Dataset(x_valid, y_valid)
+    test_dataset = Dataset(x_test, y_test)
+
+    class JAXDataLoader:
+        def __init__(self, dataset, batch_size=2, shuffle=True):
+            self.dataset = dataset
+            self.batch_size = batch_size
+            self.shuffle = shuffle
+            self.indices = jnp.arange(len(dataset.features))
+
+        def __iter__(self):
+            if self.shuffle:
+                key = jrandom.PRNGKey(seed)  # You can set a seed here for reproducibility
+                self.indices = jrandom.permutation(key, self.indices)
+
+            for start in range(0, len(self.indices), self.batch_size):
+                end = start + self.batch_size
+                batch_indices = self.indices[start:end]
+                yield (self.dataset.features[batch_indices], 
+                    self.dataset.labels[batch_indices])
+        def __len__(self):
+            return (len(self.indices) + self.batch_size - 1) // self.batch_size
+
+    train_loader = JAXDataLoader(train_dataset, batch_size=265, shuffle=True)
+    valid_loader = JAXDataLoader(valid_dataset, batch_size=50, shuffle=False)
+    test_loader = JAXDataLoader(test_dataset, batch_size=50, shuffle=False)
+
+    # Define your model using Flax
+    class MLP(nn.Module):
+        num_features: int
+        hidden_size: int
+        num_output: int
+
+        @nn.compact
+        def __call__(self, x):
+            x = nn.Dense(self.hidden_size)(x)
+            x = nn.tanh(x)
+            x = nn.Dense(self.hidden_size)(x)
+            x = nn.tanh(x)
+            x = nn.Dense(self.num_output)(x)
+            return x
+
+    # Create the optimizer with weight decay
+    def create_optimizer(optimizer_type, learning_rate, weight_decay):
+        if optimizer_type == "sgd":
+            # Create the SGD optimizer
+            optimizer = optax.sgd(learning_rate=learning_rate)
+            # Add weight decay
+            return optax.chain(optimizer, optax.add_decayed_weights(weight_decay))
+        else:  # Assuming Adam as the alternative
+            # Create the Adam optimizer
+            optimizer = optax.adam(learning_rate=learning_rate)
+            # Add weight decay
+            return optax.chain(optimizer, optax.add_decayed_weights(weight_decay))
+
+    # Create training state
+    def create_train_state(rng, model, learning_rate, weight_decay, optimizer_type):
+        params = model.init(rng, jnp.ones([1, num_features]))  # Dummy input for parameter initialization
+        optimizer = create_optimizer(optimizer_type, learning_rate, weight_decay)
+        return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
+
+    # Loss function
+    @jax.jit
+    def compute_loss(logits, labels):
+        labels = jnp.asarray(labels, dtype=jnp.int32)  # Ensure labels are int32
+        return jnp.sum(optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=labels))
+
+    # Training function
+    @jax.jit
+    def train_step(state, batch_img, batch_label):
+        def loss_fn(params):
+            logits = state.apply_fn(params, batch_img)
+            return compute_loss(logits, batch_label)
+
+        # Compute gradients
+        grad = jax.grad(loss_fn)(state.params)
+        # Update the state with the new parameters
+        new_state = state.apply_gradients(grads=grad)
+        return new_state
 
     num_features = x_train.shape[-1]
     num_output = 2
     H = 16
+    model = MLP(num_features=num_features, hidden_size=H, num_output=num_output)
 
-    model = nn.Sequential(
-        nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output)
-    )
-
-    if args.optimizer == "sgd":
-        weight_decay = 1e-2
-
-        optimizer = torch.optim.SGD(model.parameters(), lr=1e-3, weight_decay=weight_decay)
-
-        max_epoch = 2500
-    else:
-        weight_decay = 1e-3
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
-
-        max_epoch = 1500
-
-    loss_criterion = nn.CrossEntropyLoss(reduction="sum")
-
+    rng = jax.random.PRNGKey(0)
+    state = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-3, optimizer_type="sgd")
+    
+    max_epoch = 2500
     for epoch in range(max_epoch):
-        train_loss = 0
+        train_loss = 0.0
+        num_batches = 0
+        num_val_batches = 0
         for batch_img, batch_label in train_loader:
-            y_prob = model(batch_img)
+            state = train_step(state, batch_img, batch_label)
+            train_loss += compute_loss(state.apply_fn(state.params, batch_img), batch_label)
+            num_batches += 1
+        train_loss /= num_batches
 
-            loss = loss_criterion(y_prob, batch_label)
-            train_loss += loss.item()
+        # Validation step
+        val_loss = 0
+        val_accuracy = 0
+        num_val_batches = 0
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        for val_img, val_label in valid_loader:
+            logits = state.apply_fn(state.params, val_img)
+            # Calculate predictions
+            val_pred = jnp.argmax(logits, axis=1)
+            val_accuracy += jnp.sum(val_pred == val_label)
 
-        # now I can evaluate my model on the validation set
-        with torch.no_grad():
-            valid_accuracy = 0
-            for batch_img_valid, batch_label_valid in valid_loader:
-                y_valid_prob = model(batch_img_valid)
-                valid_pred = torch.argmax(y_valid_prob, dim=1)
-                valid_accuracy += (valid_pred == batch_label_valid.view(-1)).int().sum()
+            num_val_batches += 1
 
-            valid_accuracy = valid_accuracy / len(x_valid)
-            train_loss = train_loss / len(x_train)
+        val_accuracy /= len(valid_loader.indices)  # Assuming valid_loader.indices gives the total number of validation samples
 
         if (epoch + 1) % 100 == 0:
-            print("Epoch: {}, Train loss: {}, Valid acc: {}".format(epoch + 1, train_loss, valid_accuracy))
+            print("Epoch: {}, Train loss: {:.4f}, Val accuracy: {:.4f}".format(epoch + 1, train_loss, val_accuracy))
 
-    # at the end of the training I can get the map solution
-    map_solution = torch.nn.utils.parameters_to_vector(model.parameters()).detach().clone()
-
-    torch.nn.utils.vector_to_parameters(map_solution, model.parameters())
-
+    
+    map_solution = jax.device_get(jax.tree_util.tree_flatten(state.params)[0])  # Flatten parameters to a vector
     N_grid = 100
     offset = 2
     x1min = x_train[:, 0].min() - offset
@@ -167,17 +246,19 @@ def main(args):
     x2min = x_train[:, 1].min() - offset
     x2max = x_train[:, 1].max() + offset
 
-    x_grid = torch.linspace(x1min, x1max, N_grid)
-    y_grid = torch.linspace(x2min, x2max, N_grid)
-    XX1, XX2 = np.meshgrid(x_grid, y_grid)
-    X_grid = np.column_stack((XX1.ravel(), XX2.ravel()))
+    # Create grid using jnp.linspace and jnp.meshgrid
+    x_grid = jnp.linspace(x1min, x1max, N_grid)
+    y_grid = jnp.linspace(x2min, x2max, N_grid)
+    XX1, XX2 = jnp.meshgrid(x_grid, y_grid, indexing='ij')  # Use 'ij' for matrix indexing
+    X_grid = jnp.column_stack((XX1.ravel(), XX2.ravel()))
 
-    # computing and plotting the MAP confidence
-    with torch.no_grad():
-        probs_map = torch.softmax(model(torch.from_numpy(X_grid).float()), dim=1).numpy()
+    # Computing and plotting the MAP confidence
+    logits_map = state.apply_fn(state.params, X_grid)  # Compute logits
+    probs_map = jax.nn.softmax(logits_map)  # Apply softmax
 
     conf = probs_map.max(1)
 
+    # Plotting
     plt.contourf(
         XX1,
         XX2,
@@ -185,7 +266,7 @@ def main(args):
         alpha=0.8,
         antialiased=True,
         cmap="Blues",
-        levels=np.arange(0.0, 1.01, 0.1),
+        levels=jnp.arange(0.0, 1.01, 0.1),
     )
     plt.colorbar()
     plt.scatter(
@@ -197,7 +278,6 @@ def main(args):
     plt.title("Confidence MAP")
     plt.xticks([], [])
     plt.yticks([], [])
-    # plt.savefig('banana_plots_classic/MAP.pdf')
     plt.show()
 
     print("Fitting Laplace")
@@ -221,26 +301,24 @@ def main(args):
     if subset_of_weights == "last_layer":
         if hessian_structure == "diag":
             n_last_layer_weights = num_output * H + num_output
-            # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             samples = torch.randn(n_posterior_samples, la.n_params, device=device).detach()
             samples = samples * la.posterior_scale.reshape(1, la.n_params)
-            V_LA = samples.detach().numpy()
+            V_LA = samples.detach()
         else:
             n_last_layer_weights = num_output * H + num_output
             dist = MultivariateNormal(loc=torch.zeros(n_last_layer_weights), scale_tril=la.posterior_scale)
             V_LA = dist.sample((n_posterior_samples,))
-            V_LA = V_LA.detach().numpy()
+            V_LA = V_LA.detach()
     else:
         if hessian_structure == "diag":
-            # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             samples = torch.randn(n_posterior_samples, la.n_params, device=device).detach()
             samples = samples * la.posterior_scale.reshape(1, la.n_params)
-            V_LA = samples.detach().numpy()
+            V_LA = samples.detach()
 
         else:
             dist = MultivariateNormal(loc=torch.zeros_like(map_solution), scale_tril=la.posterior_scale)
             V_LA = dist.sample((n_posterior_samples,))
-            V_LA = V_LA.detach().numpy()
+            V_LA = V_LA.detach()
             print(V_LA.shape)
 
     # ok now I have the initial velocities. I can therefore consider my manifold
