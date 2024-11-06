@@ -125,7 +125,7 @@ def main(args):
         return batches
     
     # Create data loaders
-    batch_size_train = 256
+    batch_size_train = 1024
     batch_size_valid = 50
     batch_size_test = 50
     
@@ -153,9 +153,12 @@ def main(args):
     def create_train_state(rng, model, learning_rate, weight_decay, optimizer_type):
         params = model.init(rng, jnp.ones([1, num_features]))  # Dummy input for parameter initialization
         if optimizer_type == 'sgd':
-            optimizer = optimizer = optax.sgd(learning_rate=learning_rate)
+            #weight_decay = 1e-2
+            #optimizer = optax.chain(optax.sgd(learning_rate), optax.add_decayed_weights(weight_decay))
+            optimizer = optax.sgd(learning_rate)
         else:
-            optimizer = optax.adam(learning_rate=learning_rate)
+            weight_decay = 1e-3
+            optimizer = optax.chain(optax.adam(learning_rate=learning_rate), optax.add_decayed_weights(weight_decay))
         return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
 
         # Loss function
@@ -181,7 +184,7 @@ def main(args):
     num_output = 2
     H = 16
     model = MLP(num_features=num_features, hidden_size=H, num_output=num_output)
-    state = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
+    state = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type=args.optimizer)
 
     
     max_epoch = 2500
@@ -251,8 +254,11 @@ def main(args):
     plt.yticks([], [])
     plt.show()
 
-    ## Adjust this and learning rate in optax!
+    #if args.optimizer_type == 'sgd':
     weight_decay = 1e-2
+    #else:
+   #     weight_decay = 1e-3
+
 
     print("Fitting Laplace")
     la = Laplace(
@@ -759,20 +765,6 @@ def main(args):
         plt.title("All weights, full Hessian approx - Confidence OUR linearized")
         plt.show()
 
-        # plt.contourf(XX1, XX2, P_grid_LAPLACE_conf.reshape(N_grid, N_grid), alpha=0.8, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
-        # # plt.colorbar()
-        # plt.scatter(x_test[:,0], x_test[:,1], s=40, c=y_test, edgecolors='k', cmap=colors.ListedColormap(plt.cm.tab10.colors[:5]))
-        # # plt.contour(XX1,XX2, P_grid_LAPLACE_lin[:,0].reshape(N_grid, N_grid), levels=[0.5], colors='k')
-        # plt.title('All weights, full Hessian approx - Confidence LA linearized')
-        # plt.show()
-
-        # plt.contourf(XX1, XX2, P_grid_OUR_conf.reshape(N_grid, N_grid), alpha=0.8, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
-        # plt.colorbar()
-        # plt.scatter(x_test[:,0], x_test[:,1], s=40, c=y_test, edgecolors='k', cmap=colors.ListedColormap(plt.cm.tab10.colors[:5]))
-        # plt.title('All weights, full Hessian approx - Confidence OURS')
-        # # plt.contour(XX1, XX2, P_grid_OURS_lin[:,0].reshape(N_grid, N_grid), levels=[0.5], colors='k')
-        # plt.show()
-
         # I have also to add the computation on the test set
         for n in range(n_posterior_samples):
             w_LA = weights_LA[n, :]
@@ -916,26 +908,6 @@ def main(args):
         plt.xticks([], [])
         plt.yticks([], [])
         plt.show()
-
-        # plt.contourf(XX1, XX2, P_grid_LAPLACE_conf.reshape(N_grid, N_grid), alpha=0.7, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
-        # # plt.colorbar()
-        # plt.scatter(x_test[:,0], x_test[:,1], s=40, c=y_test, edgecolors='k', cmap=colors.ListedColormap(plt.cm.tab10.colors[:5]))
-        # # plt.contour(XX1,XX2, P_grid_LAPLACE_lin[:,0].reshape(N_grid, N_grid), levels=[0.5], colors='k')
-        # # plt.title('All weights, full Hessian approx - Confidence LA linearized')
-        # # plt.savefig('pinwheel_plots/confidence_la_al_prior_optim.pdf')
-        # plt.xticks([], [])
-        # plt.yticks([], [])
-        # # plt.savefig('banana_plots_classic/confidence_la_test_no_colorbar.pdf')
-        # plt.show()
-
-        # plt.contourf(XX1, XX2, P_grid_OUR_conf.reshape(N_grid, N_grid), alpha=0.7, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
-        # # plt.colorbar()
-        # plt.scatter(x_test[:,0], x_test[:,1], s=40, c=y_test, edgecolors='k', cmap=colors.ListedColormap(plt.cm.tab10.colors[:5]))
-        # # plt.title('All weights, full Hessian approx - Confidence OURS')
-        # # plt.contour(XX1, XX2, P_grid_OURS_lin[:,0].reshape(N_grid, N_grid), levels=[0.5], colors='k')
-        # # plt.savefig('pinwheel_plots/confidence_our_al_prior_optim.pdf')
-        # # plt.savefig('banana_plots_classic/confidence_our_test_no_colorbar.pdf')
-        # plt.show()
 
         # I have to add some computation in the test set that i was missing here
         P_test_LAPLACE = 0
