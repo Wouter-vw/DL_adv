@@ -55,6 +55,7 @@ def main(args):
     # run with several seeds
     seed = args.seed
     jrandom.PRNGKey(seed)
+    rng = jrandom.PRNGKey(seed)
     torch.manual_seed(seed)
     print("Seed: ", seed)
 
@@ -97,56 +98,41 @@ def main(args):
     print(f"Valid: {x_valid.shape, y_valid.shape}")
     print(f"Test: {x_test.shape, y_test.shape}")
 
-    # now I can transform them into dataaset and dataloader
-    # I have to transform everything to tensor
-    ## This will be super inefficient, comeback and fix it!!
-##    x_train = torch.from_numpy(np.copy(np.asarray(x_train))).float()
+    # define train , valid, test, create data loader for training
     x_train = x_train.astype(jnp.float32)
-##    x_valid = torch.from_numpy(np.copy(np.asarray(x_valid))).float()
     x_valid = x_valid.astype(jnp.float32)
-##    x_test = torch.from_numpy(np.copy(np.asarray(x_test))).float()
     x_test = x_test.astype(jnp.float32)
+    # labels are integers
+    y_train = y_train.astype(jnp.int32)
+    y_valid = y_valid.astype(jnp.int32)
+    y_test = y_test.astype(jnp.int32)
 
-##    y_train = torch.from_numpy(np.copy(np.asarray(y_train))).long().reshape(-1)
-    y_train = y_train.astype(jnp.float32)
-##    y_valid = torch.from_numpy(np.copy(np.asarray(y_valid))).long().reshape(-1)
-    y_valid = y_valid.astype(jnp.float32)
-##    y_test = torch.from_numpy(np.copy(np.asarray(y_test))).long().reshape(-1)
-    y_test = y_test.astype(jnp.float32)
-
-    @struct.dataclass
-    class Dataset:
-        features: jnp.ndarray
-        labels: jnp.ndarray
-
-    train_dataset = Dataset(x_train, y_train)
-    valid_dataset = Dataset(x_valid, y_valid)
-    test_dataset = Dataset(x_test, y_test)
-
-    class JAXDataLoader:
-        def __init__(self, dataset, batch_size=2, shuffle=True):
-            self.dataset = dataset
-            self.batch_size = batch_size
-            self.shuffle = shuffle
-            self.indices = jnp.arange(len(dataset.features))
-
-        def __iter__(self):
-            if self.shuffle:
-                key = jrandom.PRNGKey(seed)  # You can set a seed here for reproducibility
-                self.indices = jrandom.permutation(key, self.indices)
-
-            for start in range(0, len(self.indices), self.batch_size):
-                end = start + self.batch_size
-                batch_indices = self.indices[start:end]
-                yield (self.dataset.features[batch_indices], 
-                    self.dataset.labels[batch_indices])
-        def __len__(self):
-            return (len(self.indices) + self.batch_size - 1) // self.batch_size
-
-    train_loader = JAXDataLoader(train_dataset, batch_size=265, shuffle=True)
-    valid_loader = JAXDataLoader(valid_dataset, batch_size=50, shuffle=False)
-    test_loader = JAXDataLoader(test_dataset, batch_size=50, shuffle=False)
-
+    # Review if there is a more efficient method for this!
+    # Shuffle and batch manually
+    def create_data_loader(x_data, y_data, batch_size, shuffle=True):
+        dataset_size = len(x_data)
+        indices = jnp.arange(dataset_size)
+        
+        if shuffle:
+            indices = jrandom.permutation(rng, dataset_size, independent=True)
+        
+        # Create batches
+        batches = []
+        for i in range(0, dataset_size, batch_size):
+            batch_idx = indices[i:i+batch_size]
+            batches.append((x_data[batch_idx], y_data[batch_idx]))
+        
+        return batches
+    
+    # Create data loaders
+    batch_size_train = 256
+    batch_size_valid = 50
+    batch_size_test = 50
+    
+    train_loader = create_data_loader(x_train, y_train, batch_size=batch_size_train, shuffle=True)
+    valid_loader = create_data_loader(x_valid, y_valid, batch_size=batch_size_valid, shuffle=False)
+    test_loader = create_data_loader(x_test, y_test, batch_size=batch_size_test, shuffle=False)
+    
     # Define your model using Flax
     class MLP(nn.Module):
         num_features: int
@@ -162,26 +148,17 @@ def main(args):
             x = nn.Dense(self.num_output)(x)
             return x
 
-    # Create the optimizer with weight decay
-    def create_optimizer(optimizer_type, learning_rate, weight_decay):
-        if optimizer_type == "sgd":
-            # Create the SGD optimizer
-            optimizer = optax.sgd(learning_rate=learning_rate)
-            # Add weight decay
-            return optax.chain(optimizer, optax.add_decayed_weights(weight_decay))
-        else:  # Assuming Adam as the alternative
-            # Create the Adam optimizer
-            optimizer = optax.adam(learning_rate=learning_rate)
-            # Add weight decay
-            return optax.chain(optimizer, optax.add_decayed_weights(weight_decay))
 
     # Create training state
     def create_train_state(rng, model, learning_rate, weight_decay, optimizer_type):
         params = model.init(rng, jnp.ones([1, num_features]))  # Dummy input for parameter initialization
-        optimizer = create_optimizer(optimizer_type, learning_rate, weight_decay)
+        if optimizer_type == 'sgd':
+            optimizer = optimizer = optax.sgd(learning_rate=learning_rate)
+        else:
+            optimizer = optax.adam(learning_rate=learning_rate)
         return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
 
-    # Loss function
+        # Loss function
     @jax.jit
     def compute_loss(logits, labels):
         labels = jnp.asarray(labels, dtype=jnp.int32)  # Ensure labels are int32
@@ -204,39 +181,33 @@ def main(args):
     num_output = 2
     H = 16
     model = MLP(num_features=num_features, hidden_size=H, num_output=num_output)
+    state = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
 
-    rng = jax.random.PRNGKey(0)
-    state = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-3, optimizer_type="sgd")
     
     max_epoch = 2500
     for epoch in range(max_epoch):
         train_loss = 0.0
-        num_batches = 0
-        num_val_batches = 0
+    
+        # Training step
         for batch_img, batch_label in train_loader:
             state = train_step(state, batch_img, batch_label)
             train_loss += compute_loss(state.apply_fn(state.params, batch_img), batch_label)
-            num_batches += 1
-        train_loss /= num_batches
-
+        train_loss /= len(x_train)
+    
         # Validation step
         val_loss = 0
         val_accuracy = 0
-        num_val_batches = 0
-
+    
         for val_img, val_label in valid_loader:
             logits = state.apply_fn(state.params, val_img)
-            # Calculate predictions
             val_pred = jnp.argmax(logits, axis=1)
-            val_accuracy += jnp.sum(val_pred == val_label)
-
-            num_val_batches += 1
-
-        val_accuracy /= len(valid_loader.indices)  # Assuming valid_loader.indices gives the total number of validation samples
-
+            val_accuracy += jnp.sum(val_pred == val_label)  # Sum correct predictions
+    
+        val_accuracy /= len(x_valid)  # Calculate accuracy as the fraction of correct predictions
+    
+        # Print every 100 epochs
         if (epoch + 1) % 100 == 0:
-            print("Epoch: {}, Train loss: {:.4f}, Val accuracy: {:.4f}".format(epoch + 1, train_loss, val_accuracy))
-
+            print(f"Epoch: {epoch + 1}, Train loss: {train_loss:.4f}, Val accuracy: {val_accuracy:.4f}")
     
     map_solution = jax.device_get(jax.tree_util.tree_flatten(state.params)[0])  # Flatten parameters to a vector
     N_grid = 100
@@ -279,6 +250,9 @@ def main(args):
     plt.xticks([], [])
     plt.yticks([], [])
     plt.show()
+
+    ## Adjust this and learning rate in optax!
+    weight_decay = 1e-2
 
     print("Fitting Laplace")
     la = Laplace(
