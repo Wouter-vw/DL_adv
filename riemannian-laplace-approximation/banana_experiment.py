@@ -13,6 +13,10 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 
+from jax2torch import jax2torch
+from torch2jax import t2j
+from jax.scipy.stats import multivariate_normal
+
 import flax.linen as nn
 from flax import struct
 from flax.training import train_state
@@ -22,7 +26,7 @@ from laplace import Laplace
 import matplotlib.colors as colors
 import seaborn as sns
 import geomai.utils.geometry as geometry
-#from torch import nn
+from torch import nn as nn_torch
 from manifold import cross_entropy_manifold, linearized_cross_entropy_manifold
 from torch.distributions import MultivariateNormal
 from tqdm import tqdm
@@ -187,7 +191,7 @@ def main(args):
     state = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type=args.optimizer)
 
     
-    max_epoch = 2500
+    max_epoch = 100
     for epoch in range(max_epoch):
         train_loss = 0.0
     
@@ -212,7 +216,16 @@ def main(args):
         if (epoch + 1) % 100 == 0:
             print(f"Epoch: {epoch + 1}, Train loss: {train_loss:.4f}, Val accuracy: {val_accuracy:.4f}")
     
-    map_solution = jax.device_get(jax.tree_util.tree_flatten(state.params)[0])  # Flatten parameters to a vector
+    ### Map solution like done in pytroch, same structure!
+    params_flattened = []
+    for layer_name in ['Dense_0', 'Dense_1', 'Dense_2']: 
+        kernel = state.params['params'][layer_name]['kernel'] 
+        bias = state.params['params'][layer_name]['bias']   
+        kernel = jnp.transpose(kernel) 
+        params_flattened.extend([kernel.flatten(), bias.flatten()])
+    
+    map_solution = jnp.concatenate(params_flattened)
+    
     N_grid = 100
     offset = 2
     x1min = x_train[:, 0].min() - offset
@@ -254,21 +267,79 @@ def main(args):
     plt.yticks([], [])
     plt.show()
 
-    #if args.optimizer_type == 'sgd':
-    weight_decay = 1e-2
-    #else:
-   #     weight_decay = 1e-3
+    ## Still need to add weight decay to optimizers
+    if args.optimizer == 'sgd':
+        weight_decay = 1e-2
+    else:
+        weight_decay = 1e-3
 
+    ## Quick import of pytorch model for the laplace package!
+    model_torch= nn_torch.Sequential(
+        nn_torch.Linear(num_features, H), torch.nn.Tanh(), nn_torch.Linear(H, H), torch.nn.Tanh(), nn_torch.Linear(H, num_output)
+        )
+
+    layer_mapping = {
+        'Dense_0': model_torch[0],  # First Linear layer
+        'Dense_1': model_torch[2],  # Second Linear layer
+        'Dense_2': model_torch[4]   # Third Linear layer
+    }
+
+    # Transfer weights and biases
+    for flax_layer, torch_layer in layer_mapping.items():
+        # Convert and load Flax weights (transpose to match PyTorch)
+        weight = torch.tensor(np.array(state.params['params'][flax_layer]['kernel'])).T
+        # Ensure the weight tensor is contiguous
+        torch_layer.weight.data = weight.contiguous()
+
+        # Convert and load Flax bias (no transpose needed)
+        bias = torch.tensor(np.array(state.params['params'][flax_layer]['bias']))
+        # Ensure the bias tensor is contiguous
+        torch_layer.bias.data = bias.contiguous()
+
+    ## We can verify that the transfer went well
+    # computing and plotting the MAP confidence
+    # with torch.no_grad():
+    #     probs_map = torch.softmax(model_torch(torch.from_numpy(X_grid).float()), dim=1).numpy()
+
+    # conf = probs_map.max(1)
+
+    # # Plotting
+    # plt.contourf(
+    #     XX1,
+    #     XX2,
+    #     conf.reshape(N_grid, N_grid),
+    #     alpha=0.8,
+    #     antialiased=True,
+    #     cmap="Blues",
+    #     levels=jnp.arange(0.0, 1.01, 0.1),
+    # )
+    # plt.colorbar()
+    # plt.scatter(
+    #     x_train[:, 0][y_train == 0], x_train[:, 1][y_train == 0], c="orange", edgecolors="black", s=45, alpha=1
+    # )
+    # plt.scatter(
+    #     x_train[:, 0][y_train == 1], x_train[:, 1][y_train == 1], c="violet", edgecolors="black", s=45, alpha=1
+    # )
+    # plt.title("Confidence MAP")
+    # plt.xticks([], [])
+    # plt.yticks([], [])
+    # plt.show()
+
+    # We need to define a torch dataloader quickly
+    x_torch_train = torch.from_numpy(np.array(x_train))
+    y_torch_train = torch.from_numpy(np.array(y_train)).long()
+    train_torch_dataset = torch.utils.data.TensorDataset(x_torch_train, y_torch_train)
+    train_torch_loader = torch.utils.data.DataLoader(train_torch_dataset, batch_size=265, shuffle=True)
 
     print("Fitting Laplace")
     la = Laplace(
-        model,
+        model_torch,
         "classification",
         subset_of_weights=subset_of_weights,
         hessian_structure=hessian_structure,
         prior_precision=2 * weight_decay,
     )
-    la.fit(train_loader)
+    la.fit(train_torch_loader)
 
     if optimize_prior:
         la.optimize_prior_precision(method="marglik")
@@ -276,30 +347,33 @@ def main(args):
     print("Prior precision we are using")
     print(la.prior_precision)
 
+    ## Rewritten to use jax where possible, from now on
+    ## we seek to only use jax if we don't need external packages
     # and get some samples from it, our initial velocities
     # now I can get some samples for the Laplace approx
     if subset_of_weights == "last_layer":
         if hessian_structure == "diag":
-            n_last_layer_weights = num_output * H + num_output
-            samples = torch.randn(n_posterior_samples, la.n_params, device=device).detach()
-            samples = samples * la.posterior_scale.reshape(1, la.n_params)
-            V_LA = samples.detach()
+            n_last_layer_weights = num_output * H + num_output ## CHECK!! Why is the original not using this number?
+            samples = jax.random.normal(rng, shape=(n_posterior_samples, la.n_params))
+            samples = samples * t2j(la.posterior_scale.reshape(1, la.n_params))
+            V_LA = samples
         else:
             n_last_layer_weights = num_output * H + num_output
-            dist = MultivariateNormal(loc=torch.zeros(n_last_layer_weights), scale_tril=la.posterior_scale)
-            V_LA = dist.sample((n_posterior_samples,))
-            V_LA = V_LA.detach()
+            scale_tril = scale_tril = jnp.array(la.posterior_scale)
+            V_LA = jax.random.multivariate_normal(rng, mean=jnp.zeros(n_last_layer_weights), cov=scale_tril @ scale_tril.T, shape=(n_posterior_samples,))
     else:
         if hessian_structure == "diag":
-            samples = torch.randn(n_posterior_samples, la.n_params, device=device).detach()
-            samples = samples * la.posterior_scale.reshape(1, la.n_params)
-            V_LA = samples.detach()
+            samples = jax.random.normal(rng, shape=(n_posterior_samples, la.n_params))
+            samples = samples * t2j(la.posterior_scale.reshape(1, la.n_params))
+            V_LA = samples
 
         else:
-            dist = MultivariateNormal(loc=torch.zeros_like(map_solution), scale_tril=la.posterior_scale)
-            V_LA = dist.sample((n_posterior_samples,))
-            V_LA = V_LA.detach()
+            scale_tril = scale_tril = jnp.array(la.posterior_scale)
+            V_LA = jax.random.multivariate_normal(rng, mean=jnp.zeros_like(map_solution), cov=scale_tril @ scale_tril.T, shape=(n_posterior_samples,))
             print(V_LA.shape)
+
+ ####################### Below still to convert/reimplement! ########
+
 
     # ok now I have the initial velocities. I can therefore consider my manifold
     if args.linearized_pred:
