@@ -16,6 +16,7 @@ import jax.random as jrandom
 from jax2torch import jax2torch
 from torch2jax import t2j
 from jax.scipy.stats import multivariate_normal
+import tensorflow as tf
 
 import flax.linen as nn
 from flax import struct
@@ -216,16 +217,58 @@ def main(args):
         if (epoch + 1) % 100 == 0:
             print(f"Epoch: {epoch + 1}, Train loss: {train_loss:.4f}, Val accuracy: {val_accuracy:.4f}")
     
-    ### Map solution like done in pytroch, same structure!
-    params_flattened = []
-    for layer_name in ['Dense_0', 'Dense_1', 'Dense_2']: 
-        kernel = state.params['params'][layer_name]['kernel'] 
-        bias = state.params['params'][layer_name]['bias']   
-        kernel = jnp.transpose(kernel) 
-        params_flattened.extend([kernel.flatten(), bias.flatten()])
+    def params_from_map(map_solution, state):
+        params = {'params': {}}
+        idx = 0
+        
+        # Iterate over the layers to reconstruct the parameters dynamically
+        for layer_name, layer_params in state.params['params'].items():
+            # Get the shape of the kernel and bias
+            kernel_shape = layer_params['kernel'].shape
+            bias_shape = layer_params['bias'].shape
+            
+            # Calculate the number of elements in the kernel and bias
+            kernel_size = jnp.prod(jnp.array(kernel_shape))
+            bias_size = jnp.prod(jnp.array(bias_shape))
+
+            # Extract and reshape kernel from map_solution
+            kernel_flat = map_solution[idx:idx + kernel_size]
+            kernel = kernel_flat.reshape(kernel_shape)
+            idx += kernel_size
+            
+            # Extract and reshape bias from map_solution
+            bias_flat = map_solution[idx:idx + bias_size]
+            bias = bias_flat.reshape(bias_shape)
+            idx += bias_size
+            
+            # Assign the kernel and bias to the params dictionary
+            params['params'][layer_name] = {'kernel': kernel, 'bias': bias}
+        
+        # Replace the state with the new params
+        new_state = state.replace(params=params)
+
+        return new_state
+
+    def get_map_solution(state):
+        """Function to flatten the kernels and biases, then concatenate them."""
+        params_flattened = []
+        
+        # Iterate over the layers dynamically
+        for layer_name, layer_params in state.params['params'].items():
+            kernel = layer_params['kernel']
+            bias = layer_params['bias']
+            
+            # Transpose the kernel and flatten both kernel and bias
+            params_flattened.extend([kernel.flatten(), bias.flatten()])
+        
+        # Concatenate the flattened kernel and bias arrays
+        map_solution = jnp.concatenate(params_flattened)
+        
+        return map_solution
     
-    map_solution = jnp.concatenate(params_flattened)
-    
+    map_solution = get_map_solution(state)
+    state = params_from_map(map_solution, state)
+
     N_grid = 100
     offset = 2
     x1min = x_train[:, 0].min() - offset
@@ -372,19 +415,52 @@ def main(args):
             V_LA = jax.random.multivariate_normal(rng, mean=jnp.zeros_like(map_solution), cov=scale_tril @ scale_tril.T, shape=(n_posterior_samples,))
             print(V_LA.shape)
 
- ####################### Below still to convert/reimplement! ########
 
+    class FeatureExtractor(nn.Module):
+        num_features: int
+        H: int
+        num_output: int
+
+        def setup(self):
+            # Define the layers
+            self.dense1 = nn.Dense(self.H)
+            self.dense2 = nn.Dense(self.H)
+            self.output = nn.Dense(self.num_output)
+
+        def __call__(self, x):
+            # Pass through the layers with Tanh activations
+            x = nn.tanh(self.dense1(x))
+            x = nn.tanh(self.dense2(x))
+            return self.output(x)
+
+    # To instantiate the model ( Reminder to change weight decay, learning rate etc.. )
+    feature_extractor_model = FeatureExtractor(num_features=num_features, H=H, num_output=num_output)
+    f_state = create_train_state(rng, feature_extractor_model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
+
+    class LinearModel(nn.Module):
+        H: int
+        num_output: int
+
+        def setup(self):
+            # Define the linear layer
+            self.output = nn.Dense(self.num_output)
+
+        def __call__(self, x):
+            # Pass through the linear layer
+            return self.output(x)
+
+    # To instantiate the model ( Reminder to change weight decay, learning rate etc.. )
+    ll = LinearModel(H=H, num_output=num_output)
+    l_state = create_train_state(rng, ll, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
 
     # ok now I have the initial velocities. I can therefore consider my manifold
     if args.linearized_pred:
         # here I have to first compute the f_MAP in both cases
-        torch.nn.utils.vector_to_parameters(map_solution, model.parameters())
-
-        with torch.no_grad():
-            f_MAP = model(x_train)
+        state = params_from_map(map_solution, state)
+        f_MAP = state.apply_fn(state.params, x_train)
 
         if subset_of_weights == "last_layer":
-            weights_ours = torch.zeros(n_posterior_samples, len(map_solution))
+            weights_ours = jnp.zeros(n_posterior_samples, len(map_solution))
 
             MAP = map_solution.clone()
             feature_extractor_map = MAP[0:-n_last_layer_weights]
@@ -392,22 +468,14 @@ def main(args):
             print(feature_extractor_map.shape)
             print(ll_map.shape)
 
-            # and now I have to define again the model
-            feature_extractor_model = torch.nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh()
-            )
-            ll = nn.Linear(H, num_output)
-
-            # and use the correct weights
-            torch.nn.utils.vector_to_parameters(feature_extractor_map, feature_extractor_model.parameters())
-            torch.nn.utils.vector_to_parameters(ll_map, ll.parameters())
-
+            state_f_map = params_from_map(map_solution, f_state)
+            state_ll = params_from_map(map_solution, l_state)
+            
             # I have to precompute some stuff
             # i.e. I am treating the hidden activation before the last layer as my input
             # because since the weights are fixed, then this feature vector is fixed
-            with torch.no_grad():
-                R = feature_extractor_model(x_train)
-
+            R = f_state.apply_fn(f_state.params, x_train)
+            #################### I cannot work with the manifold yet as its still based on torch. ##########
             if optimize_prior:
                 manifold = linearized_cross_entropy_manifold(
                     ll,
@@ -423,21 +491,24 @@ def main(args):
                 manifold = linearized_cross_entropy_manifold(
                     ll, R, y_train, f_MAP=f_MAP, theta_MAP=ll_map, batching=False, lambda_reg=weight_decay
                 )
-
         else:
-            model2 = nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output)
-            )
+            state_model_2 = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
+            
             # here depending if I am using a diagonal approx, I have to redefine the model
             if batch_data:
-                # i have to create the new train loader in this case
-                new_dataset = torch.utils.data.TensorDataset(x_train, y_train, f_MAP)
-                new_train_loader = torch.utils.data.DataLoader(new_dataset, batch_size=50, shuffle=True)
+                # Create a TensorFlow dataset
+                dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train, f_MAP))
+                
+                # Shuffle, batch and prefetch for performance optimization
+                new_train_loader = dataset.shuffle(buffer_size=len(x_train))  # Shuffling the entire dataset
+                new_train_loader = new_train_loader.batch(50)  # Batch size of 50
+                new_train_loader = new_train_loader.prefetch(tf.data.AUTOTUNE)  # Automatically tune the prefetch buffer size
 
+            ########### All the lines below will not work until we have converted linearized_cross_entropy_manifold ####
             if optimize_prior:
                 if batch_data:
                     manifold = linearized_cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         new_train_loader,
                         y=None,
                         f_MAP=f_MAP,
@@ -448,7 +519,7 @@ def main(args):
 
                 else:
                     manifold = linearized_cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         x_train,
                         y_train,
                         f_MAP=f_MAP,
@@ -459,7 +530,7 @@ def main(args):
             else:
                 if batch_data:
                     manifold = linearized_cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         new_train_loader,
                         y=None,
                         f_MAP=f_MAP,
@@ -470,7 +541,7 @@ def main(args):
 
                 else:
                     manifold = linearized_cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         x_train,
                         y_train,
                         f_MAP=f_MAP,
@@ -478,12 +549,10 @@ def main(args):
                         batching=False,
                         lambda_reg=weight_decay,
                     )
-
     else:
         # here we have the usual manifold
         if subset_of_weights == "last_layer":
-            weights_ours = torch.zeros(n_posterior_samples, len(map_solution))
-            # weights_LA = torch.zeros(n_posterior_samples, len(w_MAP))
+            weights_ours = jnp.zeros(n_posterior_samples, len(map_solution))
 
             MAP = map_solution.clone()
             feature_extractor_map = MAP[0:-n_last_layer_weights]
@@ -491,21 +560,10 @@ def main(args):
             print(feature_extractor_map.shape)
             print(ll_map.shape)
 
-            # and now I have to define again the model
-            feature_extractor_model = torch.nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh()
-            )
-            ll = nn.Linear(H, num_output)
-
-            # and use the correct weights
-            torch.nn.utils.vector_to_parameters(feature_extractor_map, feature_extractor_model.parameters())
-            torch.nn.utils.vector_to_parameters(ll_map, ll.parameters())
-
-            # I have to precompute some stuff
-            # i.e. I am treating the hidden activation before the last layer as my input
-            # because since the weights are fixed, then this feature vector is fixed
-            with torch.no_grad():
-                R = feature_extractor_model(x_train)
+            state_f_map = params_from_map(map_solution, f_state)
+            state_ll = params_from_map(map_solution, l_state)
+            
+            R = f_state.apply_fn(f_state.params, x_train)
 
             if optimize_prior:
                 manifold = cross_entropy_manifold(
@@ -516,31 +574,30 @@ def main(args):
                 manifold = cross_entropy_manifold(ll, R, y_train, batching=False, lambda_reg=weight_decay)
 
         else:
-            model2 = nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output)
-            )
+            state_model_2 = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
+
             # here depending if I am using a diagonal approx, I have to redefine the model
             if optimize_prior:
                 if batch_data:
                     manifold = cross_entropy_manifold(
-                        model2, train_loader, y=None, batching=True, lambda_reg=la.prior_precision.item() / 2
+                        state_model_2, train_loader, y=None, batching=True, lambda_reg=la.prior_precision.item() / 2
                     )
 
                 else:
                     manifold = cross_entropy_manifold(
-                        model2, x_train, y_train, batching=False, lambda_reg=la.prior_precision.item() / 2
+                        state_model_2, x_train, y_train, batching=False, lambda_reg=la.prior_precision.item() / 2
                     )
             else:
                 if batch_data:
                     manifold = cross_entropy_manifold(
-                        model2, train_loader, y=None, batching=True, lambda_reg=weight_decay
+                        state_model_2, train_loader, y=None, batching=True, lambda_reg=weight_decay
                     )
 
                 else:
                     manifold = cross_entropy_manifold(
-                        model2, x_train, y_train, batching=False, lambda_reg=weight_decay
+                        state_model_2, x_train, y_train, batching=False, lambda_reg=weight_decay
                     )
-
+           ########################################### Below this I still have to rewrite in jax ################         
     # now i have my manifold and so I can solve the expmap
     weights_ours = torch.zeros(n_posterior_samples, len(map_solution))
     for n in tqdm(range(n_posterior_samples), desc="Solving expmap"):
