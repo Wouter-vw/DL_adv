@@ -217,10 +217,10 @@ def main(args):
         if (epoch + 1) % 100 == 0:
             print(f"Epoch: {epoch + 1}, Train loss: {train_loss:.4f}, Val accuracy: {val_accuracy:.4f}")
     
-    def params_from_map(map_solution, state):
+    def params_from_map(solution, state):
         params = {'params': {}}
         idx = 0
-        
+
         # Iterate over the layers to reconstruct the parameters dynamically
         for layer_name, layer_params in state.params['params'].items():
             # Get the shape of the kernel and bias
@@ -231,13 +231,18 @@ def main(args):
             kernel_size = jnp.prod(jnp.array(kernel_shape))
             bias_size = jnp.prod(jnp.array(bias_shape))
 
-            # Extract and reshape kernel from map_solution
-            kernel_flat = map_solution[idx:idx + kernel_size]
+
+            # Extract and reshape kernel from solution
+            kernel_flat = solution[idx:idx + kernel_size]
+            if kernel_flat.size == 0:
+                raise ValueError(f"Not enough elements in solution for layer {layer_name} kernel.")
             kernel = kernel_flat.reshape(kernel_shape)
             idx += kernel_size
             
             # Extract and reshape bias from map_solution
-            bias_flat = map_solution[idx:idx + bias_size]
+            bias_flat = solution[idx:idx + bias_size]
+            if bias_flat.size == 0:
+                raise ValueError(f"Not enough elements in solution for layer {layer_name} bias.")
             bias = bias_flat.reshape(bias_shape)
             idx += bias_size
             
@@ -420,18 +425,17 @@ def main(args):
         num_features: int
         H: int
         num_output: int
-
+        
         def setup(self):
             # Define the layers
             self.dense1 = nn.Dense(self.H)
             self.dense2 = nn.Dense(self.H)
-            self.output = nn.Dense(self.num_output)
-
+        
         def __call__(self, x):
             # Pass through the layers with Tanh activations
             x = nn.tanh(self.dense1(x))
             x = nn.tanh(self.dense2(x))
-            return self.output(x)
+            return x
 
     # To instantiate the model ( Reminder to change weight decay, learning rate etc.. )
     feature_extractor_model = FeatureExtractor(num_features=num_features, H=H, num_output=num_output)
@@ -451,16 +455,16 @@ def main(args):
 
     # To instantiate the model ( Reminder to change weight decay, learning rate etc.. )
     ll = LinearModel(H=H, num_output=num_output)
-    l_state = create_train_state(rng, ll, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
-
-    # ok now I have the initial velocities. I can therefore consider my manifold
+    l_state =  train_state.TrainState.create(apply_fn=ll.apply, params=ll.init(rng, jnp.ones([1, 16])), tx=optax.sgd(learning_rate=1e-3))
+    
+    #  ok now I have the initial velocities. I can therefore consider my manifold
     if args.linearized_pred:
         # here I have to first compute the f_MAP in both cases
         state = params_from_map(map_solution, state)
         f_MAP = state.apply_fn(state.params, x_train)
 
         if subset_of_weights == "last_layer":
-            weights_ours = jnp.zeros(n_posterior_samples, len(map_solution))
+            weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
 
             MAP = map_solution.clone()
             feature_extractor_map = MAP[0:-n_last_layer_weights]
@@ -468,8 +472,8 @@ def main(args):
             print(feature_extractor_map.shape)
             print(ll_map.shape)
 
-            state_f_map = params_from_map(map_solution, f_state)
-            state_ll = params_from_map(map_solution, l_state)
+            f_state = params_from_map(feature_extractor_map, f_state)
+            l_state = params_from_map(ll_map, l_state)
             
             # I have to precompute some stuff
             # i.e. I am treating the hidden activation before the last layer as my input
@@ -552,7 +556,7 @@ def main(args):
     else:
         # here we have the usual manifold
         if subset_of_weights == "last_layer":
-            weights_ours = jnp.zeros(n_posterior_samples, len(map_solution))
+            weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
 
             MAP = map_solution.clone()
             feature_extractor_map = MAP[0:-n_last_layer_weights]
@@ -560,8 +564,8 @@ def main(args):
             print(feature_extractor_map.shape)
             print(ll_map.shape)
 
-            state_f_map = params_from_map(map_solution, f_state)
-            state_ll = params_from_map(map_solution, l_state)
+            f_state = params_from_map(feature_extractor_map, f_state)
+            l_state = params_from_map(ll_map, l_state)
             
             R = f_state.apply_fn(f_state.params, x_train)
 
@@ -597,33 +601,30 @@ def main(args):
                     manifold = cross_entropy_manifold(
                         state_model_2, x_train, y_train, batching=False, lambda_reg=weight_decay
                     )
-           ########################################### Below this I still have to rewrite in jax ################         
     # now i have my manifold and so I can solve the expmap
-    weights_ours = torch.zeros(n_posterior_samples, len(map_solution))
+    weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
     for n in tqdm(range(n_posterior_samples), desc="Solving expmap"):
         v = V_LA[n, :].reshape(-1, 1)
 
         if subset_of_weights == "last_layer":
             curve, failed = geometry.expmap(manifold, ll_map.clone(), v)
             _new_ll_weights = curve(1)[0]
-            _new_weights = torch.cat(
-                (feature_extractor_map.view(-1), torch.from_numpy(_new_ll_weights).float().view(-1)), dim=0
-            )
-            weights_ours[n, :] = _new_weights.view(-1)
-            torch.nn.utils.vector_to_parameters(_new_weights, model.parameters())
-
+            _new_weights = jnp.concatenate((feature_extractor_map.reshape(-1), jnp.array(_new_ll_weights, dtype=jnp.float32).reshape(-1)), axis=0)
+            weights_ours[n, :] = _new_weights.reshape(-1)
+            state = params_from_map(_new_weights, state)
+        
         else:
             # here I can try to sample a subset of datapoints, create a new manifold and solve expmap
             if args.expmap_different_batches:
                 n_sub_data = 150
 
-                idx_sub = np.random.choice(np.arange(0, len(x_train), 1), n_sub_data, replace=False)
+                idx_sub = jax.random.choice(rng, jnp.arange(len(x_train)), shape=(n_sub_data,), replace=False)
                 sub_x_train = x_train[idx_sub, :]
                 sub_y_train = y_train[idx_sub]
                 if args.linearized_pred:
                     sub_f_MAP = f_MAP[idx_sub]
                     manifold = linearized_cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         sub_x_train,
                         sub_y_train,
                         f_MAP=sub_f_MAP,
@@ -635,7 +636,7 @@ def main(args):
                     )
                 else:
                     manifold = cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         sub_x_train,
                         sub_y_train,
                         batching=False,
@@ -648,37 +649,33 @@ def main(args):
             else:
                 curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
             _new_weights = curve(1)[0]
-            weights_ours[n, :] = torch.from_numpy(_new_weights.reshape(-1))
+            weights_ours[n, :] = jnp.array(_new_weights.reshape(-1))
 
     # I can get the LA weights
-    weights_LA = torch.zeros(n_posterior_samples, len(map_solution))
+    weights_LA = jnp.zeros((n_posterior_samples, len(map_solution)))
 
     for n in range(n_posterior_samples):
         if subset_of_weights == "last_layer":
-            laplace_weigths = torch.from_numpy(V_LA[n, :].reshape(-1)).float() + ll_map.clone()
-            laplace_weigths = torch.cat((feature_extractor_map.clone().view(-1), laplace_weigths.view(-1)), dim=0)
-            weights_LA[n, :] = laplace_weigths.cpu()
+            laplace_weights = V_LA[n, :].reshape(-1) + ll_map
+            laplace_weights = jnp.concatenate((feature_extractor_map.reshape(-1), laplace_weights.reshape(-1)), axis=0)
         else:
-            laplace_weigths = torch.from_numpy(V_LA[n, :].reshape(-1)).float() + map_solution
-            # laplace_weigths = torch.cat((feature_extractor_MAP.clone().view(-1), laplace_weigths.view(-1)), dim=0)
-            weights_LA[n, :] = laplace_weigths.cpu()
+            weights_LA[n, :] = V_LA[n, :].reshape(-1) + map_solution
 
     # now I can use my weights for prediction. Deoending if I am using linearization or not the prediction looks differently
     if args.linearized_pred:
         if subset_of_weights == "last_layer":
             # so I have to put the MAP back to the feature extraction part of the model
-            torch.nn.utils.vector_to_parameters(feature_extractor_map, feature_extractor_model.parameters())
-            torch.nn.utils.vector_to_parameters(ll_map, ll.parameters())
+            
+            f_state = params_from_map(feature_extractor_map, f_state)
+            l_state = params_from_map(ll_map, l_state)
 
             # and then I have to create the new dataset
-            with torch.no_grad():
-                R_MAP_grid = feature_extractor_model(torch.from_numpy(X_grid).float()).clone()
-                R_MAP_test = feature_extractor_model(x_test)
+            R_MAP_grid = f_state.apply_fn(f_state.params, X_grid)
+            R_MAP_test = f_state.apply_fn(f_state.params, x_test)
 
-            # I have also to compute the f_MAP here
-            with torch.no_grad():
-                f_MAP_grid = ll(R_MAP_grid).clone()
-                f_MAP_test = ll(R_MAP_test)
+
+            f_MAP_grid = l_state.apply_fn(l_state.params, R_MAP_grid)
+            f_MAP_test = l_state.apply_fn(l_state.params, R_MAP_test)
 
             # now I have my dataset, and I have also the initial velocities I
             # computed for LA
