@@ -29,7 +29,6 @@ import seaborn as sns
 import geomai.utils.geometry as geometry
 from torch import nn as nn_torch
 from manifold import cross_entropy_manifold, linearized_cross_entropy_manifold
-from torch.distributions import MultivariateNormal
 from tqdm import tqdm
 import sklearn.datasets
 from datautils import make_pinwheel_data
@@ -37,8 +36,6 @@ from utils.metrics import accuracy, nll, brier, calibration
 from sklearn.metrics import brier_score_loss
 import argparse
 from torchmetrics.functional.classification import calibration_error
-from functorch import grad, jvp, make_functional, vjp, make_functional_with_buffers, hessian, jacfwd, jacrev, vmap
-from functorch_utils import get_params_structure, stack_gradient, custum_hvp, stack_gradient2
 import os
 
 jax.config.update('jax_enable_x64', True)
@@ -53,7 +50,6 @@ def main(args):
     security_check = True
     optimize_prior = args.optimize_prior
     print("Are we optimizing the prior? ", optimize_prior)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     batch_data = args.batch_data
 
@@ -155,15 +151,16 @@ def main(args):
 
 
     # Create training state
-    def create_train_state(rng, model, learning_rate, weight_decay, optimizer_type):
+    def create_train_state(rng, model, optimizer):
         params = model.init(rng, jnp.ones([1, num_features]))  # Dummy input for parameter initialization
-        if optimizer_type == 'sgd':
-            #weight_decay = 1e-2
-            #optimizer = optax.chain(optax.sgd(learning_rate), optax.add_decayed_weights(weight_decay))
+        if optimizer == "sgd":
+            learning_rate = 1e-3
+            weight_decay = 1e-2
             optimizer = optax.sgd(learning_rate)
         else:
+            learning_rate = 1e-3
             weight_decay = 1e-3
-            optimizer = optax.chain(optax.adam(learning_rate=learning_rate), optax.add_decayed_weights(weight_decay))
+            optimizer = optax.adamw(learning_rate, weight_decay=weight_decay)
         return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
 
         # Loss function
@@ -189,10 +186,19 @@ def main(args):
     num_output = 2
     H = 16
     model = MLP(num_features=num_features, hidden_size=H, num_output=num_output)
-    state = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type=args.optimizer)
+    state = create_train_state(rng, model, optimizer=args.optimizer)
 
-    
-    max_epoch = 100
+
+    if args.optimizer == "sgd":
+        learning_rate = 1e-3
+        weight_decay = 1e-2
+        optimizer = optax.sgd(learning_rate)
+        max_epoch = 2500
+    else:
+        learning_rate = 1e-3
+        weight_decay = 1e-3
+        optimizer = optax.adamw(learning_rate, weight_decay=weight_decay)
+        max_epoch = 1500  
     for epoch in range(max_epoch):
         train_loss = 0.0
     
@@ -315,11 +321,6 @@ def main(args):
     plt.yticks([], [])
     plt.show()
 
-    ## Still need to add weight decay to optimizers
-    if args.optimizer == 'sgd':
-        weight_decay = 1e-2
-    else:
-        weight_decay = 1e-3
 
     ## Quick import of pytorch model for the laplace package!
     model_torch= nn_torch.Sequential(
@@ -439,7 +440,7 @@ def main(args):
 
     # To instantiate the model ( Reminder to change weight decay, learning rate etc.. )
     feature_extractor_model = FeatureExtractor(num_features=num_features, H=H, num_output=num_output)
-    f_state = create_train_state(rng, feature_extractor_model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
+    f_state = create_train_state(rng, feature_extractor_model, optimizer=args.optimizer)
 
     class LinearModel(nn.Module):
         H: int
@@ -455,7 +456,7 @@ def main(args):
 
     # To instantiate the model ( Reminder to change weight decay, learning rate etc.. )
     ll = LinearModel(H=H, num_output=num_output)
-    l_state =  train_state.TrainState.create(apply_fn=ll.apply, params=ll.init(rng, jnp.ones([1, 16])), tx=optax.sgd(learning_rate=1e-3))
+    l_state =  train_state.TrainState.create(apply_fn=ll.apply, params=ll.init(rng, jnp.ones([1, 16])), tx=optimizer)
     
     #  ok now I have the initial velocities. I can therefore consider my manifold
     if args.linearized_pred:
@@ -496,7 +497,7 @@ def main(args):
                     ll, R, y_train, f_MAP=f_MAP, theta_MAP=ll_map, batching=False, lambda_reg=weight_decay
                 )
         else:
-            state_model_2 = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
+            state_model_2 = create_train_state(rng, model, optimizer=args.optimizer)
             
             # here depending if I am using a diagonal approx, I have to redefine the model
             if batch_data:
@@ -578,7 +579,7 @@ def main(args):
                 manifold = cross_entropy_manifold(ll, R, y_train, batching=False, lambda_reg=weight_decay)
 
         else:
-            state_model_2 = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
+            state_model_2 = create_train_state(rng, model, optimizer=args.optimizer)
 
             # here depending if I am using a diagonal approx, I have to redefine the model
             if optimize_prior:
@@ -679,11 +680,10 @@ def main(args):
 
             # now I have my dataset, and I have also the initial velocities I
             # computed for LA
-
             # I guess I should not consider the softmax here
             def predict(params, data):
-                y_pred = fmodel(params, buffers, data)
-                return y_pred
+                params_dict = {'params': {'output': {'kernel': params[0],'bias': params[1]}}}
+                return l_state.apply_fn(params_dict, data)
 
             P_grid_LAPLACE_lin = 0
             P_grid_OURS_lin = 0
@@ -697,24 +697,19 @@ def main(args):
                     ll_map
                 ), "We have a problem in the length of the last layer weights we are considering"
                 # put the weights into the model
-                torch.nn.utils.vector_to_parameters(ll_map, ll.parameters())
-                ll.zero_grad()
+                l_state = params_from_map(ll_map, l_state)
+                params = l_state.params['params']['output']['kernel'], l_state.params['params']['output']['bias']  
 
-                diff_weights = w_ll_LA - ll_map
+                diff_weights = (w_ll_LA - ll_map).astype(jnp.float32)
 
-                fmodel, params, buffers = make_functional_with_buffers(ll)
-
-                diff_as_params = get_params_structure(diff_weights, params)
-
-                # here I have to use the new dataset to predict
-                _, jvp_value_grid = jvp(
-                    predict, (params, R_MAP_grid), (diff_as_params, torch.zeros_like(R_MAP_grid)), strict=False
-                )
+                diff_as_params = params_from_map(diff_weights, l_state).params['params']['output']['kernel'], params_from_map(diff_weights, l_state).params['params']['output']['bias']
+                
+                _, jvp_value_grid = jax.jvp(predict, (params, R_MAP_grid),(diff_as_params, jnp.zeros_like(R_MAP_grid)))
 
                 f_LA_grid = f_MAP_grid + jvp_value_grid
 
-                probs_grid = torch.softmax(f_LA_grid, dim=1)
-                P_grid_LAPLACE_lin += probs_grid.detach().numpy()
+                probs_grid = jax.nn.softmax(f_LA_grid, axis=1)
+                P_grid_LAPLACE_lin += probs_grid
 
             # I should also do the same with our model (and use the tangent vector)
             # because if we use the final weights we get something wrong
@@ -725,34 +720,36 @@ def main(args):
                     ll_map
                 ), "We have a problem in the length of the last layer weights we are considering"
                 # put the weights into the model
-                torch.nn.utils.vector_to_parameters(ll_map, ll.parameters())
-                ll.zero_grad()
+                l_state = params_from_map(ll_map, l_state)
+                params = l_state.params['params']['output']['kernel'], l_state.params['params']['output']['bias']  
 
-                diff_weights = w_ll_OUR - ll_map
+                diff_weights = (w_ll_OUR - ll_map).astype(jnp.float32)
 
-                fmodel, params, buffers = make_functional_with_buffers(ll)
+                diff_as_params = params_from_map(diff_weights, l_state).params['params']['output']['kernel'], params_from_map(diff_weights, l_state).params['params']['output']['bias']
 
-                diff_as_params = get_params_structure(diff_weights, params)
-
-                # here I have to use the new dataset to predict
-                _, jvp_value_grid = jvp(
-                    predict, (params, R_MAP_grid), (diff_as_params, torch.zeros_like(R_MAP_grid)), strict=False
-                )
+                _, jvp_value_grid = jax.jvp(predict, (params, R_MAP_grid),(diff_as_params, jnp.zeros_like(R_MAP_grid)))
 
                 f_OUR_grid = f_MAP_grid + jvp_value_grid
 
-                probs_grid = torch.softmax(f_OUR_grid, dim=1)
-                P_grid_OURS_lin += probs_grid.detach().numpy()
-
+                probs_grid = jax.nn.softmax(f_OUR_grid, axis=1)
+                P_grid_OUR_lin += probs_grid
         else:
-            torch.nn.utils.vector_to_parameters(map_solution, model2.parameters())
-            with torch.no_grad():
-                f_MAP_grid = model2(torch.from_numpy(X_grid).float()).clone()
-                f_MAP_test = model2(x_test)
+            state_model_2 = params_from_map(map_solution, state_model_2)
+            f_MAP_grid = state_model_2.apply_fn(state_model_2.params, X_grid)
+            f_MAP_test = state_model_2.apply_fn(state_model_2.params, x_test)
 
             def predict(params, data):
-                y_pred = fmodel(params, buffers, data)
-                return y_pred
+                param_names = ['Dense_0', 'Dense_1', 'Dense_2']
+                params_dict = {
+                    'params': {
+                        param_names[i]: {
+                            'kernel': params[i * 2], 
+                            'bias': params[i * 2 + 1]
+                        }
+                        for i in range(len(param_names))
+                    }
+                }
+                return state_model_2.apply_fn(params_dict, data)
 
             P_grid_LAPLACE_lin = 0
             P_grid_OURS_lin = 0
@@ -763,52 +760,70 @@ def main(args):
             for n in range(n_posterior_samples):
                 w_LA = weights_LA[n, :]
                 # put the weights into the model
-                torch.nn.utils.vector_to_parameters(map_solution, model2.parameters())
-                model2.zero_grad()
-
-                diff_weights = w_LA - map_solution
-
-                fmodel, params, buffers = make_functional_with_buffers(model2)
-
-                diff_as_params = get_params_structure(diff_weights, params)
-
-                _, jvp_value_grid = jvp(
-                    predict,
-                    (params, torch.from_numpy(X_grid).float()),
-                    (diff_as_params, torch.zeros_like(torch.from_numpy(X_grid).float())),
-                    strict=False,
+                state_model_2 = params_from_map(map_solution, state_model_2)
+                params = (
+                    state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
+                    state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
+                    state_model_2.params['params']['Dense_1']['kernel'],  # Dense_1 kernel
+                    state_model_2.params['params']['Dense_1']['bias'],    # Dense_1 bias
+                    state_model_2.params['params']['Dense_2']['kernel'],  # Dense_2 kernel
+                    state_model_2.params['params']['Dense_2']['bias'],    # Dense_2 bias
                 )
+
+                diff_weights = (w_LA - map_solution).astype(jnp.float32)
+                
+                diff_as_params = (
+                    params_from_map(diff_weights, state_model_2 ).params['params']['Dense_0']['kernel'],  # Dense_0 kernel
+                    params_from_map(diff_weights, state_model_2).params['params']['Dense_0']['bias'],    # Dense_0 bias
+                    params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['kernel'],  # Dense_1 kernel
+                    params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['bias'],    # Dense_1 bias
+                    params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['kernel'],  # Dense_2 kernel
+                    params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['bias'],    # Dense_2 bias
+                )
+                _, jvp_value_grid = jax.jvp(
+                    predict,
+                    (params, X_grid),
+                    (diff_as_params, jnp.zeros_like(X_grid)))
 
                 f_LA_grid = f_MAP_grid + jvp_value_grid
 
-                probs_grid = torch.softmax(f_LA_grid, dim=1)
-                P_grid_LAPLACE_lin += probs_grid.detach().numpy()
+                probs_grid = jax.nn.softmax(f_LA_grid, axis=1)
+                P_grid_LAPLACE_lin += probs_grid
 
             # now I can do the same for our method
             for n in range(n_posterior_samples):
                 # get the theta weights we are interested in #
                 w_OUR = weights_ours[n, :]
-                torch.nn.utils.vector_to_parameters(map_solution, model2.parameters())
-                model2.zero_grad()
-
-                diff_weights = w_OUR - map_solution
-
-                fmodel, params, buffers = make_functional_with_buffers(model2)
-
-                # I have to make the diff_weights with the same tree shape as the params
-                diff_as_params = get_params_structure(diff_weights, params)
-
-                _, jvp_value_grid = jvp(
-                    predict,
-                    (params, torch.from_numpy(X_grid).float()),
-                    (diff_as_params, torch.zeros_like(torch.from_numpy(X_grid).float())),
-                    strict=False,
+                state_model_2 = params_from_map(map_solution, state_model_2)
+                params = (
+                    state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
+                    state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
+                    state_model_2.params['params']['Dense_1']['kernel'],  # Dense_1 kernel
+                    state_model_2.params['params']['Dense_1']['bias'],    # Dense_1 bias
+                    state_model_2.params['params']['Dense_2']['kernel'],  # Dense_2 kernel
+                    state_model_2.params['params']['Dense_2']['bias'],    # Dense_2 bias
                 )
+
+                diff_weights = (w_OUR - map_solution).astype(jnp.float32)
+
+                diff_as_params = (
+                    params_from_map(diff_weights, state_model_2 ).params['params']['Dense_0']['kernel'],  # Dense_0 kernel
+                    params_from_map(diff_weights, state_model_2).params['params']['Dense_0']['bias'],    # Dense_0 bias
+                    params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['kernel'],  # Dense_1 kernel
+                    params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['bias'],    # Dense_1 bias
+                    params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['kernel'],  # Dense_2 kernel
+                    params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['bias'],    # Dense_2 bias
+                )
+
+                _, jvp_value_grid = jax.jvp(
+                    predict,
+                    (params, X_grid),
+                    (diff_as_params, jnp.zeros_like(X_grid)))
 
                 f_OUR_grid = f_MAP_grid + jvp_value_grid
 
-                probs_grid = torch.softmax(f_OUR_grid, dim=1)
-                P_grid_OURS_lin += probs_grid.detach().numpy()
+                probs_grid = jax.nn.softmax(f_OUR_grid, axis=1)
+                P_grid_OUR_lin += probs_grid
 
         P_grid_LAPLACE_lin /= n_posterior_samples
 
@@ -897,55 +912,78 @@ def main(args):
         for n in range(n_posterior_samples):
             w_LA = weights_LA[n, :]
             # put the weights into the model
-            torch.nn.utils.vector_to_parameters(map_solution, model2.parameters())
-            model2.zero_grad()
-
-            diff_weights = w_LA - map_solution
-
-            fmodel, params, buffers = make_functional_with_buffers(model2)
-
-            diff_as_params = get_params_structure(diff_weights, params)
-
-            _, jvp_value_test = jvp(
-                predict, (params, x_test), (diff_as_params, torch.zeros_like(x_test)), strict=False
+            state_model_2 = params_from_map(map_solution, state_model_2)
+            params = (
+                state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
+                state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
+                state_model_2.params['params']['Dense_1']['kernel'],  # Dense_1 kernel
+                state_model_2.params['params']['Dense_1']['bias'],    # Dense_1 bias
+                state_model_2.params['params']['Dense_2']['kernel'],  # Dense_2 kernel
+                state_model_2.params['params']['Dense_2']['bias'],    # Dense_2 bias
             )
+
+            diff_weights = (w_LA - map_solution).astype(jnp.float32)
+                
+            diff_as_params = (
+                params_from_map(diff_weights, state_model_2 ).params['params']['Dense_0']['kernel'],  # Dense_0 kernel
+                params_from_map(diff_weights, state_model_2).params['params']['Dense_0']['bias'],    # Dense_0 bias
+                params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['kernel'],  # Dense_1 kernel
+                params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['bias'],    # Dense_1 bias
+                params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['kernel'],  # Dense_2 kernel
+                params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['bias'],    # Dense_2 bias
+            )
+            _, jvp_value_test = jax.jvp(
+                predict,
+                (params, x_test),
+                (diff_as_params, jnp.zeros_like(x_test)))
 
             f_LA_test = f_MAP_test + jvp_value_test
 
-            probs_test = torch.softmax(f_LA_test, dim=1)
-            P_test_LAPLACE += probs_test.detach()
+            probs_grid = jax.nn.softmax(f_LA_test, axis=1)
+            P_test_LAPLACE += probs_test
 
         # now I can do the same for our method
         for n in range(n_posterior_samples):
             # get the theta weights we are interested in #
             w_OUR = weights_ours[n, :]
-            torch.nn.utils.vector_to_parameters(map_solution, model2.parameters())
-            model2.zero_grad()
-
-            diff_weights = w_OUR - map_solution
-
-            fmodel, params, buffers = make_functional_with_buffers(model2)
-
-            # I have to make the diff_weights with the same tree shape as the params
-            diff_as_params = get_params_structure(diff_weights, params)
-
-            _, jvp_value_grid = jvp(
-                predict, (params, x_test), (diff_as_params, torch.zeros_like(x_test)), strict=False
+            state_model_2 = params_from_map(map_solution, state_model_2)
+            params = (
+                state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
+                state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
+                state_model_2.params['params']['Dense_1']['kernel'],  # Dense_1 kernel
+                state_model_2.params['params']['Dense_1']['bias'],    # Dense_1 bias
+                state_model_2.params['params']['Dense_2']['kernel'],  # Dense_2 kernel
+                state_model_2.params['params']['Dense_2']['bias'],    # Dense_2 bias
             )
 
-            f_OUR_test = f_MAP_test + jvp_value_grid
+            diff_weights = (w_OUR - map_solution).astype(jnp.float32)
 
-            probs_test = torch.softmax(f_OUR_test, dim=1)
-            P_test_OURS += probs_test.detach()
+            diff_as_params = (
+                params_from_map(diff_weights, state_model_2 ).params['params']['Dense_0']['kernel'],  # Dense_0 kernel
+                params_from_map(diff_weights, state_model_2).params['params']['Dense_0']['bias'],    # Dense_0 bias
+                params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['kernel'],  # Dense_1 kernel
+                params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['bias'],    # Dense_1 bias
+                params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['kernel'],  # Dense_2 kernel
+                params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['bias'],    # Dense_2 bias
+            )
+
+            _, jvp_value_test = jax.jvp(
+                predict,
+                (params, x_test),
+                (diff_as_params, jnp.zeros_like(x_test)))
+
+            f_OUR_test = f_MAP_test + jvp_value_test
+
+            probs_test = jax.nn.softmax(f_OUR_test, axis=1)
+            P_grid_OUR_lin += probs_test
 
     else:
         P_grid_LAPLACE = 0
         for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
-            torch.nn.utils.vector_to_parameters(weights_LA[n, :], model.parameters())
+            state = params_from_map(weights_LA[n, :], state)
             # compute the predictions
-            with torch.no_grad():
-                P_grid_LAPLACE += torch.softmax(model(torch.from_numpy(X_grid).float()), dim=1).numpy()
+            P_grid_LAPLACE += jax.nn.softmax(state.apply_fn(state.params, X_grid), axis=1)
 
         P_grid_LAPLACE /= n_posterior_samples
 
@@ -993,10 +1031,9 @@ def main(args):
         P_grid_OUR = 0
         for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
-            torch.nn.utils.vector_to_parameters(weights_ours[n, :], model.parameters())
+            state = params_from_map(weights_ours[n, :], state)
             # compute the predictions
-            with torch.no_grad():
-                P_grid_OUR += torch.softmax(model(torch.from_numpy(X_grid).float()), dim=1).numpy()
+            P_grid_our += jax.nn.softmax(state.apply_fn(state.params, X_grid), axis=1)
 
         P_grid_OUR /= n_posterior_samples
         P_grid_OUR_conf = P_grid_OUR.max(1)
@@ -1039,26 +1076,23 @@ def main(args):
 
         # I have to add some computation in the test set that i was missing here
         P_test_LAPLACE = 0
-        for n in tqdm(range(n_posterior_samples), desc="computing laplace prediction in region"):
+        for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
-            torch.nn.utils.vector_to_parameters(weights_LA[n, :], model.parameters())
+            state = params_from_map(weights_LA[n, :], state)
             # compute the predictions
-            with torch.no_grad():
-                P_test_LAPLACE += torch.softmax(model(x_test), dim=1)
+            P_test_LAPLACE += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
 
         P_test_OURS = 0
-        for n in tqdm(range(n_posterior_samples), desc="computing laplace prediction in region"):
+        for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
-            torch.nn.utils.vector_to_parameters(weights_ours[n, :], model.parameters())
+            state = params_from_map(weights_ours[n, :], state)
             # compute the predictions
-            with torch.no_grad():
-                P_test_OURS += torch.softmax(model(x_test), dim=1)
-
+            P_test_OURS += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
+        
     # I can compute and plot the results
     # here I can also compute the MAP results
-    torch.nn.utils.vector_to_parameters(map_solution, model.parameters())
-    with torch.no_grad():
-        P_test_MAP = torch.softmax(model(x_test), dim=1)
+    state = params_from_map(map_solution, state)
+    P_test_MAP += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
 
     accuracy_MAP = accuracy(P_test_MAP, y_test)
 
