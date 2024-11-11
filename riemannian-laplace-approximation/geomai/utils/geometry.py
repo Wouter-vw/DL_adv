@@ -1,25 +1,19 @@
-import numpy as np
 import sys
-
-import torch
-from scipy.integrate import solve_ivp
-import scipy.integrate as integrate
+import jax
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
-# import sklearn.neighbors.graph as knn_graph
-from scipy.interpolate import CubicSpline
-# from csaps import csaps
 
 
-# Draws an elipsoid that correspond to the metric
 def plot_metric(x, cov, color='r', inverse_metric=False, linewidth=1):
-    eigvals, eigvecs = np.linalg.eig(cov)
+    ### Done only for hermitian/symmetric cov
+    eigvals, eigvecs = jnp.linalg.eigh(cov)
     N = 100
-    theta = np.linspace(0, 2 * np.pi, N)
-    theta = theta.reshape(N, 1)
-    points = np.concatenate((np.cos(theta), np.sin(theta)), axis=1)
-    points = points * np.sqrt(eigvals)
-    points = np.matmul(eigvecs, points.transpose()).transpose()
+    theta = jnp.linspace(0, 2 * jnp.pi, N).reshape(N, 1)
+    points = jnp.concatenate((jnp.cos(theta), jnp.sin(theta)), axis=1)
+    points = points * jnp.sqrt(eigvals)
+    points = jnp.matmul(eigvecs, points.T).T
     points = points + x.flatten()
+    points = jnp.array(points)  # Convert to a regular array for plotting compatibility
     plt.plot(points[:, 0], points[:, 1], c=color, linewidth=linewidth, label='Metric')
 
 
