@@ -115,7 +115,11 @@ def main(args):
         H = 10  # hidden layer size ----> # maybe add rejection step for H>6
         # activ_fun = torch.nn.Tanh()  # With ReLU I am getting some strange Hessian
         model = torch.nn.Sequential(
-            torch.nn.Linear(1, H), torch.nn.Tanh(), torch.nn.Linear(H, H), torch.nn.Tanh(), torch.nn.Linear(H, 1)
+            torch.nn.Linear(1, H), 
+            torch.nn.Tanh(), 
+            torch.nn.Linear(H, H), 
+            torch.nn.Tanh(), 
+            torch.nn.Linear(H, 1)
         )
 
         if args.optimizer == "adam":
