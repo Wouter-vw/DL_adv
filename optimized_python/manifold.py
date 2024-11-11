@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from torch.func import functional_call, grad, vmap, hvp
+from torch.func import functional_call, grad, vmap
+from torch.autograd.functional import hvp
 from torch.utils.data import DataLoader
 
 
