@@ -9,12 +9,25 @@ import matplotlib
 import matplotlib.pyplot as plt
 import sys
 import sklearn.model_selection
+import jax
+import jax.numpy as jnp
+import jax.random as jrandom
+
+from jax2torch import jax2torch
+from torch2jax import t2j
+from jax.scipy.stats import multivariate_normal
+import tensorflow as tf
+
+import flax.linen as nn
+from flax import struct
+from flax.training import train_state
+import optax
 
 from laplace import Laplace
 import matplotlib.colors as colors
 import seaborn as sns
 import geomai.utils.geometry as geometry
-from torch import nn
+from torch import nn as nn_torch
 from manifold import cross_entropy_manifold, linearized_cross_entropy_manifold
 from torch.distributions import MultivariateNormal
 from tqdm import tqdm
@@ -28,11 +41,11 @@ from functorch import grad, jvp, make_functional, vjp, make_functional_with_buff
 from functorch_utils import get_params_structure, stack_gradient, custum_hvp, stack_gradient2
 import os
 
+jax.config.update('jax_enable_x64', True)
 
 def main(args):
-    # sns.set_style('darkgrid')
     palette = sns.color_palette("colorblind")
-    print("Linearizatin?")
+    print("Linearization?")
     print(args.linearized_pred)
     subset_of_weights = args.subset  #'last_layer' # either 'last_layer' or 'all'
     hessian_structure = args.structure  #'full' # other possibility is 'diag' or 'full'
@@ -46,7 +59,8 @@ def main(args):
 
     # run with several seeds
     seed = args.seed
-    np.random.seed(seed)
+    jrandom.PRNGKey(seed)
+    rng = jrandom.PRNGKey(seed)
     torch.manual_seed(seed)
     print("Seed: ", seed)
 
@@ -54,13 +68,14 @@ def main(args):
     # now I have to laod the banana dataset
     filen = os.path.join("data", "banana", "banana.csv")
     Xy = np.loadtxt(filen, delimiter=",")
+    Xy = jnp.asarray(Xy)
     x_train, y_train = Xy[:, :-1], Xy[:, -1]
     x_test, y_test = Xy[:0, :-1], Xy[:0, -1]
     y_train, y_test = y_train - 1, y_test - 1
 
     split_train_size = 0.7
     strat = None
-    x_full, y_full = np.concatenate((x_train, x_test)), np.concatenate((y_train, y_test))
+    x_full, y_full = jnp.concatenate((x_train, x_test)), jnp.concatenate((y_train, y_test))
     x_train, x_test, y_train, y_test = sklearn.model_selection.train_test_split(
         x_full, y_full, train_size=split_train_size, random_state=230, shuffle=shuffle, stratify=strat
     )
@@ -88,77 +103,176 @@ def main(args):
     print(f"Valid: {x_valid.shape, y_valid.shape}")
     print(f"Test: {x_test.shape, y_test.shape}")
 
-    # now I can transform them into dataaset and dataloader
-    # I have to transform everything to tensor
-    x_train = torch.from_numpy(x_train).float()
-    x_valid = torch.from_numpy(x_valid).float()
-    x_test = torch.from_numpy(x_test).float()
+    # define train , valid, test, create data loader for training
+    x_train = x_train.astype(jnp.float32)
+    x_valid = x_valid.astype(jnp.float32)
+    x_test = x_test.astype(jnp.float32)
+    # labels are integers
+    y_train = y_train.astype(jnp.int32)
+    y_valid = y_valid.astype(jnp.int32)
+    y_test = y_test.astype(jnp.int32)
 
-    y_train = torch.from_numpy(y_train).long().reshape(-1)
-    y_valid = torch.from_numpy(y_valid).long().reshape(-1)
-    y_test = torch.from_numpy(y_test).long().reshape(-1)
+    # Review if there is a more efficient method for this!
+    # Shuffle and batch manually
+    def create_data_loader(x_data, y_data, batch_size, shuffle=True):
+        dataset_size = len(x_data)
+        indices = jnp.arange(dataset_size)
+        
+        if shuffle:
+            indices = jrandom.permutation(rng, dataset_size, independent=True)
+        
+        # Create batches
+        batches = []
+        for i in range(0, dataset_size, batch_size):
+            batch_idx = indices[i:i+batch_size]
+            batches.append((x_data[batch_idx], y_data[batch_idx]))
+        
+        return batches
+    
+    # Create data loaders
+    batch_size_train = 1024
+    batch_size_valid = 50
+    batch_size_test = 50
+    
+    train_loader = create_data_loader(x_train, y_train, batch_size=batch_size_train, shuffle=True)
+    valid_loader = create_data_loader(x_valid, y_valid, batch_size=batch_size_valid, shuffle=False)
+    test_loader = create_data_loader(x_test, y_test, batch_size=batch_size_test, shuffle=False)
+    
+    # Define your model using Flax
+    class MLP(nn.Module):
+        num_features: int
+        hidden_size: int
+        num_output: int
 
-    train_dataset = torch.utils.data.TensorDataset(x_train, y_train)
-    valid_dataset = torch.utils.data.TensorDataset(x_valid, y_valid)
-    test_dataset = torch.utils.data.TensorDataset(x_test, y_test)
+        @nn.compact
+        def __call__(self, x):
+            x = nn.Dense(self.hidden_size)(x)
+            x = nn.tanh(x)
+            x = nn.Dense(self.hidden_size)(x)
+            x = nn.tanh(x)
+            x = nn.Dense(self.num_output)(x)
+            return x
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=265, shuffle=True)
-    valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=50, shuffle=False)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=50, shuffle=False)
+
+    # Create training state
+    def create_train_state(rng, model, learning_rate, weight_decay, optimizer_type):
+        params = model.init(rng, jnp.ones([1, num_features]))  # Dummy input for parameter initialization
+        if optimizer_type == 'sgd':
+            #weight_decay = 1e-2
+            #optimizer = optax.chain(optax.sgd(learning_rate), optax.add_decayed_weights(weight_decay))
+            optimizer = optax.sgd(learning_rate)
+        else:
+            weight_decay = 1e-3
+            optimizer = optax.chain(optax.adam(learning_rate=learning_rate), optax.add_decayed_weights(weight_decay))
+        return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
+
+        # Loss function
+    @jax.jit
+    def compute_loss(logits, labels):
+        labels = jnp.asarray(labels, dtype=jnp.int32)  # Ensure labels are int32
+        return jnp.sum(optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=labels))
+
+    # Training function
+    @jax.jit
+    def train_step(state, batch_img, batch_label):
+        def loss_fn(params):
+            logits = state.apply_fn(params, batch_img)
+            return compute_loss(logits, batch_label)
+
+        # Compute gradients
+        grad = jax.grad(loss_fn)(state.params)
+        # Update the state with the new parameters
+        new_state = state.apply_gradients(grads=grad)
+        return new_state
 
     num_features = x_train.shape[-1]
     num_output = 2
     H = 16
+    model = MLP(num_features=num_features, hidden_size=H, num_output=num_output)
+    state = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type=args.optimizer)
 
-    model = nn.Sequential(
-        nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output)
-    )
-
-    if args.optimizer == "sgd":
-        weight_decay = 1e-2
-
-        optimizer = torch.optim.SGD(model.parameters(), lr=1e-3, weight_decay=weight_decay)
-
-        max_epoch = 2500
-    else:
-        weight_decay = 1e-3
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
-
-        max_epoch = 1500
-
-    loss_criterion = nn.CrossEntropyLoss(reduction="sum")
-
+    
+    max_epoch = 100
     for epoch in range(max_epoch):
-        train_loss = 0
+        train_loss = 0.0
+    
+        # Training step
         for batch_img, batch_label in train_loader:
-            y_prob = model(batch_img)
-
-            loss = loss_criterion(y_prob, batch_label)
-            train_loss += loss.item()
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        # now I can evaluate my model on the validation set
-        with torch.no_grad():
-            valid_accuracy = 0
-            for batch_img_valid, batch_label_valid in valid_loader:
-                y_valid_prob = model(batch_img_valid)
-                valid_pred = torch.argmax(y_valid_prob, dim=1)
-                valid_accuracy += (valid_pred == batch_label_valid.view(-1)).int().sum()
-
-            valid_accuracy = valid_accuracy / len(x_valid)
-            train_loss = train_loss / len(x_train)
-
+            state = train_step(state, batch_img, batch_label)
+            train_loss += compute_loss(state.apply_fn(state.params, batch_img), batch_label)
+        train_loss /= len(x_train)
+    
+        # Validation step
+        val_loss = 0
+        val_accuracy = 0
+    
+        for val_img, val_label in valid_loader:
+            logits = state.apply_fn(state.params, val_img)
+            val_pred = jnp.argmax(logits, axis=1)
+            val_accuracy += jnp.sum(val_pred == val_label)  # Sum correct predictions
+    
+        val_accuracy /= len(x_valid)  # Calculate accuracy as the fraction of correct predictions
+    
+        # Print every 100 epochs
         if (epoch + 1) % 100 == 0:
-            print("Epoch: {}, Train loss: {}, Valid acc: {}".format(epoch + 1, train_loss, valid_accuracy))
+            print(f"Epoch: {epoch + 1}, Train loss: {train_loss:.4f}, Val accuracy: {val_accuracy:.4f}")
+    
+    def params_from_map(solution, state):
+        params = {'params': {}}
+        idx = 0
 
-    # at the end of the training I can get the map solution
-    map_solution = torch.nn.utils.parameters_to_vector(model.parameters()).detach().clone()
+        # Iterate over the layers to reconstruct the parameters dynamically
+        for layer_name, layer_params in state.params['params'].items():
+            # Get the shape of the kernel and bias
+            kernel_shape = layer_params['kernel'].shape
+            bias_shape = layer_params['bias'].shape
+            
+            # Calculate the number of elements in the kernel and bias
+            kernel_size = jnp.prod(jnp.array(kernel_shape))
+            bias_size = jnp.prod(jnp.array(bias_shape))
 
-    torch.nn.utils.vector_to_parameters(map_solution, model.parameters())
+
+            # Extract and reshape kernel from solution
+            kernel_flat = solution[idx:idx + kernel_size]
+            if kernel_flat.size == 0:
+                raise ValueError(f"Not enough elements in solution for layer {layer_name} kernel.")
+            kernel = kernel_flat.reshape(kernel_shape)
+            idx += kernel_size
+            
+            # Extract and reshape bias from map_solution
+            bias_flat = solution[idx:idx + bias_size]
+            if bias_flat.size == 0:
+                raise ValueError(f"Not enough elements in solution for layer {layer_name} bias.")
+            bias = bias_flat.reshape(bias_shape)
+            idx += bias_size
+            
+            # Assign the kernel and bias to the params dictionary
+            params['params'][layer_name] = {'kernel': kernel, 'bias': bias}
+        
+        # Replace the state with the new params
+        new_state = state.replace(params=params)
+
+        return new_state
+
+    def get_map_solution(state):
+        """Function to flatten the kernels and biases, then concatenate them."""
+        params_flattened = []
+        
+        # Iterate over the layers dynamically
+        for layer_name, layer_params in state.params['params'].items():
+            kernel = layer_params['kernel']
+            bias = layer_params['bias']
+            
+            # Transpose the kernel and flatten both kernel and bias
+            params_flattened.extend([kernel.flatten(), bias.flatten()])
+        
+        # Concatenate the flattened kernel and bias arrays
+        map_solution = jnp.concatenate(params_flattened)
+        
+        return map_solution
+    
+    map_solution = get_map_solution(state)
+    state = params_from_map(map_solution, state)
 
     N_grid = 100
     offset = 2
@@ -167,17 +281,19 @@ def main(args):
     x2min = x_train[:, 1].min() - offset
     x2max = x_train[:, 1].max() + offset
 
-    x_grid = torch.linspace(x1min, x1max, N_grid)
-    y_grid = torch.linspace(x2min, x2max, N_grid)
-    XX1, XX2 = np.meshgrid(x_grid, y_grid)
-    X_grid = np.column_stack((XX1.ravel(), XX2.ravel()))
+    # Create grid using jnp.linspace and jnp.meshgrid
+    x_grid = jnp.linspace(x1min, x1max, N_grid)
+    y_grid = jnp.linspace(x2min, x2max, N_grid)
+    XX1, XX2 = jnp.meshgrid(x_grid, y_grid, indexing='ij')  # Use 'ij' for matrix indexing
+    X_grid = jnp.column_stack((XX1.ravel(), XX2.ravel()))
 
-    # computing and plotting the MAP confidence
-    with torch.no_grad():
-        probs_map = torch.softmax(model(torch.from_numpy(X_grid).float()), dim=1).numpy()
+    # Computing and plotting the MAP confidence
+    logits_map = state.apply_fn(state.params, X_grid)  # Compute logits
+    probs_map = jax.nn.softmax(logits_map)  # Apply softmax
 
     conf = probs_map.max(1)
 
+    # Plotting
     plt.contourf(
         XX1,
         XX2,
@@ -185,7 +301,7 @@ def main(args):
         alpha=0.8,
         antialiased=True,
         cmap="Blues",
-        levels=np.arange(0.0, 1.01, 0.1),
+        levels=jnp.arange(0.0, 1.01, 0.1),
     )
     plt.colorbar()
     plt.scatter(
@@ -197,18 +313,81 @@ def main(args):
     plt.title("Confidence MAP")
     plt.xticks([], [])
     plt.yticks([], [])
-    # plt.savefig('banana_plots_classic/MAP.pdf')
     plt.show()
+
+    ## Still need to add weight decay to optimizers
+    if args.optimizer == 'sgd':
+        weight_decay = 1e-2
+    else:
+        weight_decay = 1e-3
+
+    ## Quick import of pytorch model for the laplace package!
+    model_torch= nn_torch.Sequential(
+        nn_torch.Linear(num_features, H), torch.nn.Tanh(), nn_torch.Linear(H, H), torch.nn.Tanh(), nn_torch.Linear(H, num_output)
+        )
+
+    layer_mapping = {
+        'Dense_0': model_torch[0],  # First Linear layer
+        'Dense_1': model_torch[2],  # Second Linear layer
+        'Dense_2': model_torch[4]   # Third Linear layer
+    }
+
+    # Transfer weights and biases
+    for flax_layer, torch_layer in layer_mapping.items():
+        # Convert and load Flax weights (transpose to match PyTorch)
+        weight = torch.tensor(np.array(state.params['params'][flax_layer]['kernel'])).T
+        # Ensure the weight tensor is contiguous
+        torch_layer.weight.data = weight.contiguous()
+
+        # Convert and load Flax bias (no transpose needed)
+        bias = torch.tensor(np.array(state.params['params'][flax_layer]['bias']))
+        # Ensure the bias tensor is contiguous
+        torch_layer.bias.data = bias.contiguous()
+
+    ## We can verify that the transfer went well
+    # computing and plotting the MAP confidence
+    # with torch.no_grad():
+    #     probs_map = torch.softmax(model_torch(torch.from_numpy(X_grid).float()), dim=1).numpy()
+
+    # conf = probs_map.max(1)
+
+    # # Plotting
+    # plt.contourf(
+    #     XX1,
+    #     XX2,
+    #     conf.reshape(N_grid, N_grid),
+    #     alpha=0.8,
+    #     antialiased=True,
+    #     cmap="Blues",
+    #     levels=jnp.arange(0.0, 1.01, 0.1),
+    # )
+    # plt.colorbar()
+    # plt.scatter(
+    #     x_train[:, 0][y_train == 0], x_train[:, 1][y_train == 0], c="orange", edgecolors="black", s=45, alpha=1
+    # )
+    # plt.scatter(
+    #     x_train[:, 0][y_train == 1], x_train[:, 1][y_train == 1], c="violet", edgecolors="black", s=45, alpha=1
+    # )
+    # plt.title("Confidence MAP")
+    # plt.xticks([], [])
+    # plt.yticks([], [])
+    # plt.show()
+
+    # We need to define a torch dataloader quickly
+    x_torch_train = torch.from_numpy(np.array(x_train))
+    y_torch_train = torch.from_numpy(np.array(y_train)).long()
+    train_torch_dataset = torch.utils.data.TensorDataset(x_torch_train, y_torch_train)
+    train_torch_loader = torch.utils.data.DataLoader(train_torch_dataset, batch_size=265, shuffle=True)
 
     print("Fitting Laplace")
     la = Laplace(
-        model,
+        model_torch,
         "classification",
         subset_of_weights=subset_of_weights,
         hessian_structure=hessian_structure,
         prior_precision=2 * weight_decay,
     )
-    la.fit(train_loader)
+    la.fit(train_torch_loader)
 
     if optimize_prior:
         la.optimize_prior_precision(method="marglik")
@@ -216,43 +395,76 @@ def main(args):
     print("Prior precision we are using")
     print(la.prior_precision)
 
+    ## Rewritten to use jax where possible, from now on
+    ## we seek to only use jax if we don't need external packages
     # and get some samples from it, our initial velocities
     # now I can get some samples for the Laplace approx
     if subset_of_weights == "last_layer":
         if hessian_structure == "diag":
-            n_last_layer_weights = num_output * H + num_output
-            # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            samples = torch.randn(n_posterior_samples, la.n_params, device=device).detach()
-            samples = samples * la.posterior_scale.reshape(1, la.n_params)
-            V_LA = samples.detach().numpy()
+            n_last_layer_weights = num_output * H + num_output ## CHECK!! Why is the original not using this number?
+            samples = jax.random.normal(rng, shape=(n_posterior_samples, la.n_params))
+            samples = samples * t2j(la.posterior_scale.reshape(1, la.n_params))
+            V_LA = samples
         else:
             n_last_layer_weights = num_output * H + num_output
-            dist = MultivariateNormal(loc=torch.zeros(n_last_layer_weights), scale_tril=la.posterior_scale)
-            V_LA = dist.sample((n_posterior_samples,))
-            V_LA = V_LA.detach().numpy()
+            scale_tril = scale_tril = jnp.array(la.posterior_scale)
+            V_LA = jax.random.multivariate_normal(rng, mean=jnp.zeros(n_last_layer_weights), cov=scale_tril @ scale_tril.T, shape=(n_posterior_samples,))
     else:
         if hessian_structure == "diag":
-            # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            samples = torch.randn(n_posterior_samples, la.n_params, device=device).detach()
-            samples = samples * la.posterior_scale.reshape(1, la.n_params)
-            V_LA = samples.detach().numpy()
+            samples = jax.random.normal(rng, shape=(n_posterior_samples, la.n_params))
+            samples = samples * t2j(la.posterior_scale.reshape(1, la.n_params))
+            V_LA = samples
 
         else:
-            dist = MultivariateNormal(loc=torch.zeros_like(map_solution), scale_tril=la.posterior_scale)
-            V_LA = dist.sample((n_posterior_samples,))
-            V_LA = V_LA.detach().numpy()
+            scale_tril = scale_tril = jnp.array(la.posterior_scale)
+            V_LA = jax.random.multivariate_normal(rng, mean=jnp.zeros_like(map_solution), cov=scale_tril @ scale_tril.T, shape=(n_posterior_samples,))
             print(V_LA.shape)
 
-    # ok now I have the initial velocities. I can therefore consider my manifold
+
+    class FeatureExtractor(nn.Module):
+        num_features: int
+        H: int
+        num_output: int
+        
+        def setup(self):
+            # Define the layers
+            self.dense1 = nn.Dense(self.H)
+            self.dense2 = nn.Dense(self.H)
+        
+        def __call__(self, x):
+            # Pass through the layers with Tanh activations
+            x = nn.tanh(self.dense1(x))
+            x = nn.tanh(self.dense2(x))
+            return x
+
+    # To instantiate the model ( Reminder to change weight decay, learning rate etc.. )
+    feature_extractor_model = FeatureExtractor(num_features=num_features, H=H, num_output=num_output)
+    f_state = create_train_state(rng, feature_extractor_model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
+
+    class LinearModel(nn.Module):
+        H: int
+        num_output: int
+
+        def setup(self):
+            # Define the linear layer
+            self.output = nn.Dense(self.num_output)
+
+        def __call__(self, x):
+            # Pass through the linear layer
+            return self.output(x)
+
+    # To instantiate the model ( Reminder to change weight decay, learning rate etc.. )
+    ll = LinearModel(H=H, num_output=num_output)
+    l_state =  train_state.TrainState.create(apply_fn=ll.apply, params=ll.init(rng, jnp.ones([1, 16])), tx=optax.sgd(learning_rate=1e-3))
+    
+    #  ok now I have the initial velocities. I can therefore consider my manifold
     if args.linearized_pred:
         # here I have to first compute the f_MAP in both cases
-        torch.nn.utils.vector_to_parameters(map_solution, model.parameters())
-
-        with torch.no_grad():
-            f_MAP = model(x_train)
+        state = params_from_map(map_solution, state)
+        f_MAP = state.apply_fn(state.params, x_train)
 
         if subset_of_weights == "last_layer":
-            weights_ours = torch.zeros(n_posterior_samples, len(map_solution))
+            weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
 
             MAP = map_solution.clone()
             feature_extractor_map = MAP[0:-n_last_layer_weights]
@@ -260,22 +472,14 @@ def main(args):
             print(feature_extractor_map.shape)
             print(ll_map.shape)
 
-            # and now I have to define again the model
-            feature_extractor_model = torch.nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh()
-            )
-            ll = nn.Linear(H, num_output)
-
-            # and use the correct weights
-            torch.nn.utils.vector_to_parameters(feature_extractor_map, feature_extractor_model.parameters())
-            torch.nn.utils.vector_to_parameters(ll_map, ll.parameters())
-
+            f_state = params_from_map(feature_extractor_map, f_state)
+            l_state = params_from_map(ll_map, l_state)
+            
             # I have to precompute some stuff
             # i.e. I am treating the hidden activation before the last layer as my input
             # because since the weights are fixed, then this feature vector is fixed
-            with torch.no_grad():
-                R = feature_extractor_model(x_train)
-
+            R = f_state.apply_fn(f_state.params, x_train)
+            #################### I cannot work with the manifold yet as its still based on torch. ##########
             if optimize_prior:
                 manifold = linearized_cross_entropy_manifold(
                     ll,
@@ -291,21 +495,24 @@ def main(args):
                 manifold = linearized_cross_entropy_manifold(
                     ll, R, y_train, f_MAP=f_MAP, theta_MAP=ll_map, batching=False, lambda_reg=weight_decay
                 )
-
         else:
-            model2 = nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output)
-            )
+            state_model_2 = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
+            
             # here depending if I am using a diagonal approx, I have to redefine the model
             if batch_data:
-                # i have to create the new train loader in this case
-                new_dataset = torch.utils.data.TensorDataset(x_train, y_train, f_MAP)
-                new_train_loader = torch.utils.data.DataLoader(new_dataset, batch_size=50, shuffle=True)
+                # Create a TensorFlow dataset
+                dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train, f_MAP))
+                
+                # Shuffle, batch and prefetch for performance optimization
+                new_train_loader = dataset.shuffle(buffer_size=len(x_train))  # Shuffling the entire dataset
+                new_train_loader = new_train_loader.batch(50)  # Batch size of 50
+                new_train_loader = new_train_loader.prefetch(tf.data.AUTOTUNE)  # Automatically tune the prefetch buffer size
 
+            ########### All the lines below will not work until we have converted linearized_cross_entropy_manifold ####
             if optimize_prior:
                 if batch_data:
                     manifold = linearized_cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         new_train_loader,
                         y=None,
                         f_MAP=f_MAP,
@@ -316,7 +523,7 @@ def main(args):
 
                 else:
                     manifold = linearized_cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         x_train,
                         y_train,
                         f_MAP=f_MAP,
@@ -327,7 +534,7 @@ def main(args):
             else:
                 if batch_data:
                     manifold = linearized_cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         new_train_loader,
                         y=None,
                         f_MAP=f_MAP,
@@ -338,7 +545,7 @@ def main(args):
 
                 else:
                     manifold = linearized_cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         x_train,
                         y_train,
                         f_MAP=f_MAP,
@@ -346,12 +553,10 @@ def main(args):
                         batching=False,
                         lambda_reg=weight_decay,
                     )
-
     else:
         # here we have the usual manifold
         if subset_of_weights == "last_layer":
-            weights_ours = torch.zeros(n_posterior_samples, len(map_solution))
-            # weights_LA = torch.zeros(n_posterior_samples, len(w_MAP))
+            weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
 
             MAP = map_solution.clone()
             feature_extractor_map = MAP[0:-n_last_layer_weights]
@@ -359,21 +564,10 @@ def main(args):
             print(feature_extractor_map.shape)
             print(ll_map.shape)
 
-            # and now I have to define again the model
-            feature_extractor_model = torch.nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh()
-            )
-            ll = nn.Linear(H, num_output)
-
-            # and use the correct weights
-            torch.nn.utils.vector_to_parameters(feature_extractor_map, feature_extractor_model.parameters())
-            torch.nn.utils.vector_to_parameters(ll_map, ll.parameters())
-
-            # I have to precompute some stuff
-            # i.e. I am treating the hidden activation before the last layer as my input
-            # because since the weights are fixed, then this feature vector is fixed
-            with torch.no_grad():
-                R = feature_extractor_model(x_train)
+            f_state = params_from_map(feature_extractor_map, f_state)
+            l_state = params_from_map(ll_map, l_state)
+            
+            R = f_state.apply_fn(f_state.params, x_train)
 
             if optimize_prior:
                 manifold = cross_entropy_manifold(
@@ -384,57 +578,53 @@ def main(args):
                 manifold = cross_entropy_manifold(ll, R, y_train, batching=False, lambda_reg=weight_decay)
 
         else:
-            model2 = nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output)
-            )
+            state_model_2 = create_train_state(rng, model, learning_rate=1e-3, weight_decay=1e-2, optimizer_type="sgd")
+
             # here depending if I am using a diagonal approx, I have to redefine the model
             if optimize_prior:
                 if batch_data:
                     manifold = cross_entropy_manifold(
-                        model2, train_loader, y=None, batching=True, lambda_reg=la.prior_precision.item() / 2
+                        state_model_2, train_loader, y=None, batching=True, lambda_reg=la.prior_precision.item() / 2
                     )
 
                 else:
                     manifold = cross_entropy_manifold(
-                        model2, x_train, y_train, batching=False, lambda_reg=la.prior_precision.item() / 2
+                        state_model_2, x_train, y_train, batching=False, lambda_reg=la.prior_precision.item() / 2
                     )
             else:
                 if batch_data:
                     manifold = cross_entropy_manifold(
-                        model2, train_loader, y=None, batching=True, lambda_reg=weight_decay
+                        state_model_2, train_loader, y=None, batching=True, lambda_reg=weight_decay
                     )
 
                 else:
                     manifold = cross_entropy_manifold(
-                        model2, x_train, y_train, batching=False, lambda_reg=weight_decay
+                        state_model_2, x_train, y_train, batching=False, lambda_reg=weight_decay
                     )
-
     # now i have my manifold and so I can solve the expmap
-    weights_ours = torch.zeros(n_posterior_samples, len(map_solution))
+    weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
     for n in tqdm(range(n_posterior_samples), desc="Solving expmap"):
         v = V_LA[n, :].reshape(-1, 1)
 
         if subset_of_weights == "last_layer":
             curve, failed = geometry.expmap(manifold, ll_map.clone(), v)
             _new_ll_weights = curve(1)[0]
-            _new_weights = torch.cat(
-                (feature_extractor_map.view(-1), torch.from_numpy(_new_ll_weights).float().view(-1)), dim=0
-            )
-            weights_ours[n, :] = _new_weights.view(-1)
-            torch.nn.utils.vector_to_parameters(_new_weights, model.parameters())
-
+            _new_weights = jnp.concatenate((feature_extractor_map.reshape(-1), jnp.array(_new_ll_weights, dtype=jnp.float32).reshape(-1)), axis=0)
+            weights_ours[n, :] = _new_weights.reshape(-1)
+            state = params_from_map(_new_weights, state)
+        
         else:
             # here I can try to sample a subset of datapoints, create a new manifold and solve expmap
             if args.expmap_different_batches:
                 n_sub_data = 150
 
-                idx_sub = np.random.choice(np.arange(0, len(x_train), 1), n_sub_data, replace=False)
+                idx_sub = jax.random.choice(rng, jnp.arange(len(x_train)), shape=(n_sub_data,), replace=False)
                 sub_x_train = x_train[idx_sub, :]
                 sub_y_train = y_train[idx_sub]
                 if args.linearized_pred:
                     sub_f_MAP = f_MAP[idx_sub]
                     manifold = linearized_cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         sub_x_train,
                         sub_y_train,
                         f_MAP=sub_f_MAP,
@@ -446,7 +636,7 @@ def main(args):
                     )
                 else:
                     manifold = cross_entropy_manifold(
-                        model2,
+                        state_model_2,
                         sub_x_train,
                         sub_y_train,
                         batching=False,
@@ -459,37 +649,33 @@ def main(args):
             else:
                 curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
             _new_weights = curve(1)[0]
-            weights_ours[n, :] = torch.from_numpy(_new_weights.reshape(-1))
+            weights_ours[n, :] = jnp.array(_new_weights.reshape(-1))
 
     # I can get the LA weights
-    weights_LA = torch.zeros(n_posterior_samples, len(map_solution))
+    weights_LA = jnp.zeros((n_posterior_samples, len(map_solution)))
 
     for n in range(n_posterior_samples):
         if subset_of_weights == "last_layer":
-            laplace_weigths = torch.from_numpy(V_LA[n, :].reshape(-1)).float() + ll_map.clone()
-            laplace_weigths = torch.cat((feature_extractor_map.clone().view(-1), laplace_weigths.view(-1)), dim=0)
-            weights_LA[n, :] = laplace_weigths.cpu()
+            laplace_weights = V_LA[n, :].reshape(-1) + ll_map
+            laplace_weights = jnp.concatenate((feature_extractor_map.reshape(-1), laplace_weights.reshape(-1)), axis=0)
         else:
-            laplace_weigths = torch.from_numpy(V_LA[n, :].reshape(-1)).float() + map_solution
-            # laplace_weigths = torch.cat((feature_extractor_MAP.clone().view(-1), laplace_weigths.view(-1)), dim=0)
-            weights_LA[n, :] = laplace_weigths.cpu()
+            weights_LA[n, :] = V_LA[n, :].reshape(-1) + map_solution
 
     # now I can use my weights for prediction. Deoending if I am using linearization or not the prediction looks differently
     if args.linearized_pred:
         if subset_of_weights == "last_layer":
             # so I have to put the MAP back to the feature extraction part of the model
-            torch.nn.utils.vector_to_parameters(feature_extractor_map, feature_extractor_model.parameters())
-            torch.nn.utils.vector_to_parameters(ll_map, ll.parameters())
+            
+            f_state = params_from_map(feature_extractor_map, f_state)
+            l_state = params_from_map(ll_map, l_state)
 
             # and then I have to create the new dataset
-            with torch.no_grad():
-                R_MAP_grid = feature_extractor_model(torch.from_numpy(X_grid).float()).clone()
-                R_MAP_test = feature_extractor_model(x_test)
+            R_MAP_grid = f_state.apply_fn(f_state.params, X_grid)
+            R_MAP_test = f_state.apply_fn(f_state.params, x_test)
 
-            # I have also to compute the f_MAP here
-            with torch.no_grad():
-                f_MAP_grid = ll(R_MAP_grid).clone()
-                f_MAP_test = ll(R_MAP_test)
+
+            f_MAP_grid = l_state.apply_fn(l_state.params, R_MAP_grid)
+            f_MAP_test = l_state.apply_fn(l_state.params, R_MAP_test)
 
             # now I have my dataset, and I have also the initial velocities I
             # computed for LA
@@ -707,20 +893,6 @@ def main(args):
         plt.title("All weights, full Hessian approx - Confidence OUR linearized")
         plt.show()
 
-        # plt.contourf(XX1, XX2, P_grid_LAPLACE_conf.reshape(N_grid, N_grid), alpha=0.8, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
-        # # plt.colorbar()
-        # plt.scatter(x_test[:,0], x_test[:,1], s=40, c=y_test, edgecolors='k', cmap=colors.ListedColormap(plt.cm.tab10.colors[:5]))
-        # # plt.contour(XX1,XX2, P_grid_LAPLACE_lin[:,0].reshape(N_grid, N_grid), levels=[0.5], colors='k')
-        # plt.title('All weights, full Hessian approx - Confidence LA linearized')
-        # plt.show()
-
-        # plt.contourf(XX1, XX2, P_grid_OUR_conf.reshape(N_grid, N_grid), alpha=0.8, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
-        # plt.colorbar()
-        # plt.scatter(x_test[:,0], x_test[:,1], s=40, c=y_test, edgecolors='k', cmap=colors.ListedColormap(plt.cm.tab10.colors[:5]))
-        # plt.title('All weights, full Hessian approx - Confidence OURS')
-        # # plt.contour(XX1, XX2, P_grid_OURS_lin[:,0].reshape(N_grid, N_grid), levels=[0.5], colors='k')
-        # plt.show()
-
         # I have also to add the computation on the test set
         for n in range(n_posterior_samples):
             w_LA = weights_LA[n, :]
@@ -864,26 +1036,6 @@ def main(args):
         plt.xticks([], [])
         plt.yticks([], [])
         plt.show()
-
-        # plt.contourf(XX1, XX2, P_grid_LAPLACE_conf.reshape(N_grid, N_grid), alpha=0.7, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
-        # # plt.colorbar()
-        # plt.scatter(x_test[:,0], x_test[:,1], s=40, c=y_test, edgecolors='k', cmap=colors.ListedColormap(plt.cm.tab10.colors[:5]))
-        # # plt.contour(XX1,XX2, P_grid_LAPLACE_lin[:,0].reshape(N_grid, N_grid), levels=[0.5], colors='k')
-        # # plt.title('All weights, full Hessian approx - Confidence LA linearized')
-        # # plt.savefig('pinwheel_plots/confidence_la_al_prior_optim.pdf')
-        # plt.xticks([], [])
-        # plt.yticks([], [])
-        # # plt.savefig('banana_plots_classic/confidence_la_test_no_colorbar.pdf')
-        # plt.show()
-
-        # plt.contourf(XX1, XX2, P_grid_OUR_conf.reshape(N_grid, N_grid), alpha=0.7, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
-        # # plt.colorbar()
-        # plt.scatter(x_test[:,0], x_test[:,1], s=40, c=y_test, edgecolors='k', cmap=colors.ListedColormap(plt.cm.tab10.colors[:5]))
-        # # plt.title('All weights, full Hessian approx - Confidence OURS')
-        # # plt.contour(XX1, XX2, P_grid_OURS_lin[:,0].reshape(N_grid, N_grid), levels=[0.5], colors='k')
-        # # plt.savefig('pinwheel_plots/confidence_our_al_prior_optim.pdf')
-        # # plt.savefig('banana_plots_classic/confidence_our_test_no_colorbar.pdf')
-        # plt.show()
 
         # I have to add some computation in the test set that i was missing here
         P_test_LAPLACE = 0
