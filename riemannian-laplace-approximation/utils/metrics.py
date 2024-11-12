@@ -157,3 +157,52 @@ def print_metrics_per_sample(args, metrics_list):
     for metrics_dict in metrics_list:
         for metric, m_list in metrics_dict.items():
             print(">", metric, m_list)
+
+
+
+### Test
+# N = 20  # number of samples
+# C = 3   # number of classes
+
+# y_true = torch.tensor([2, 0, 1, 2, 1, 0, 1, 2, 0, 1, 0, 1, 2, 2, 0, 1, 0, 2, 1, 0])
+
+# # Fixed p_y_test values as a tensor of probabilities, each row summing to 1
+# y_pred = torch.tensor([
+#     [0.607, 0.175, 0.218],
+#     [0.079, 0.849, 0.072],
+#     [0.199, 0.434, 0.367],
+#     [0.288, 0.292, 0.420],
+#     [0.210, 0.512, 0.278],
+#     [0.467, 0.324, 0.209],
+#     [0.335, 0.275, 0.390],
+#     [0.215, 0.118, 0.667],
+#     [0.754, 0.169, 0.077],
+#     [0.162, 0.491, 0.347],
+#     [0.303, 0.609, 0.088],
+#     [0.135, 0.488, 0.377],
+#     [0.145, 0.279, 0.576],
+#     [0.266, 0.116, 0.618],
+#     [0.554, 0.343, 0.103],
+#     [0.224, 0.574, 0.202],
+#     [0.690, 0.245, 0.065],
+#     [0.121, 0.212, 0.667],
+#     [0.327, 0.411, 0.262],
+#     [0.515, 0.269, 0.216]
+# ])
+
+# # Test if y_pred sums to 1
+# assert torch.allclose(y_pred.sum(1), torch.ones(N))
+
+# print("Accuracy: ", accuracy(y_pred, y_true))
+# print("NLL: ", nll(y_pred, y_true))
+# print("Brier: ", brier(y_pred, y_true))
+# _ece, _mce = calibration(y_pred, y_true)
+# print("ECE: ", _ece)
+# print("MCE: ", _mce)
+
+### Results
+# Accuracy:  80.0
+# NLL:  0.8151565860712264
+# Brier:  0.15734966667301464
+# ECE:  44.264999777078636
+# MCE:  84.89999771118164
