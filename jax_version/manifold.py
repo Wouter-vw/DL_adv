@@ -11,12 +11,16 @@ import jax.numpy as jnp
 from jax import grad, jvp, vjp, hessian, jacfwd, jacrev, vmap
 from functools import partial
 import flax.linen as nn
+<<<<<<< HEAD
 import flax
+=======
+>>>>>>> e8a9642 (Merge from timo)
 import numpy as np
 import math
 import time
 import copy
 import optax
+<<<<<<< HEAD
 from dataclasses import dataclass
 
 @dataclass(frozen=True)
@@ -125,6 +129,8 @@ def make_zero_tangent(x):
         return jax.ShapeDtypeStruct(x.shape, jax.dtypes.float0)
     else:
         return jnp.zeros_like(x)
+=======
+>>>>>>> e8a9642 (Merge from timo)
 
 class regression_manifold:
     def __init__(self, model, X, y, batching=False, lambda_reg=None, noise_var=1):
@@ -473,6 +479,7 @@ class cross_entropy_manifold:
         params = self.unravel_fn(current_point)
         velocity_params = self.unravel_fn(velocity)
 
+<<<<<<< HEAD
         n_params = len(current_point)
     
         # Initialize accumulated gradient as a zero vector of shape (n_params, 1)
@@ -495,10 +502,28 @@ class cross_entropy_manifold:
             flat_grad_per_batch, _ = jax.flatten_util.ravel_pytree(grad_per_batch)
             flat_grad_per_batch = flat_grad_per_batch.reshape(-1, 1)
             grad_data_fitting_term = flat_grad_per_batch
+=======
+        # Compute gradient of data fitting term
+        if self.batching:
+            grad_data_fitting_term = None
+            for batch_x, batch_y in self.X:
+                data = (batch_x, batch_y)
+                grad_per_batch = self.compute_grad_data_fitting_term(params, data)
+                if grad_data_fitting_term is None:
+                    grad_data_fitting_term = grad_per_batch
+                else:
+                    grad_data_fitting_term = jax.tree_util.tree_map(
+                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
+                    )
+        else:
+            data = (self.X, self.y)
+            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data)
+>>>>>>> e8a9642 (Merge from timo)
 
         # Compute gradient of L2 regularization
         grad_reg = self.compute_grad_L2_reg(params)
         if grad_reg is not None:
+<<<<<<< HEAD
             # Flatten and reshape grad_reg
             flat_grad_reg, _ = jax.flatten_util.ravel_pytree(grad_reg)
             flat_grad_reg = flat_grad_reg.reshape(-1, 1)
@@ -507,10 +532,22 @@ class cross_entropy_manifold:
         else:
             total_grad = grad_data_fitting_term
 
+=======
+            total_grad = jax.tree_util.tree_map(
+                lambda x, y: x + y, grad_data_fitting_term, grad_reg
+            )
+        else:
+            total_grad = grad_data_fitting_term
+
+        # Flatten total gradient
+        flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
+
+>>>>>>> e8a9642 (Merge from timo)
         # Define total loss function
         def total_loss_fn(p):
             return self.CE_loss(p, data) + self.L2_norm(p)
 
+<<<<<<< HEAD
         # Compute HVP of CE_loss including data in primals and zero tangents for data
         if self.batching:
             # Initialize accumulated HVP
@@ -549,6 +586,17 @@ class cross_entropy_manifold:
         numerator = jnp.dot(flat_velocity, total_hvp)
         denom = 1.0 + jnp.dot(total_grad.T, total_grad).item()  # total_grad is (n_params, 1)
         second_derivative = - (total_grad.flatten() / denom) * numerator
+=======
+        # Compute Hessian-vector product
+        hvp_fn = lambda v: jax.jvp(grad(total_loss_fn), (params,), (v,))[1]
+        hvp_params = hvp_fn(velocity_params)
+        flat_hvp, _ = jax.flatten_util.ravel_pytree(hvp_params)
+
+        # Compute second derivative
+        denom = 1.0 + jnp.dot(flat_total_grad, flat_total_grad)
+        numerator = jnp.dot(velocity.squeeze(), flat_hvp)
+        second_derivative = - (flat_total_grad / denom) * numerator
+>>>>>>> e8a9642 (Merge from timo)
 
         if return_hvp:
             return second_derivative, flat_hvp
@@ -618,6 +666,7 @@ class linearized_cross_entropy_manifold:
     def is_diagonal():
         return False
 
+<<<<<<< HEAD
     @partial(jax.jit, static_argnums=(0, 5))
     def CE_loss(self, params, data, f_MAP, theta_MAP, jvp_fn, factor=None):
         x, y = data
@@ -630,6 +679,19 @@ class linearized_cross_entropy_manifold:
         loss = jnp.sum(loss)
         if factor is not None:
             loss *= factor
+=======
+    def CE_loss(self, params, data, f_MAP):
+        x, y = data
+        # Compute difference between params and theta_MAP
+        diff_params = jax.tree_util.tree_map(lambda a, b: a - b, params, self.theta_MAP)
+        # Compute jvp
+        _, jvp_value = jvp(lambda p: self.model.apply({'params': p}, x), (self.theta_MAP,), (diff_params,))
+        logits = f_MAP + jvp_value
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+        loss = jnp.sum(loss)
+        if self.factor is not None:
+            loss *= self.factor
+>>>>>>> e8a9642 (Merge from timo)
         return loss
 
     def L2_norm(self, params):
@@ -638,9 +700,14 @@ class linearized_cross_entropy_manifold:
         w_norm = sum([jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params)])
         return self.lambda_reg * w_norm
 
+<<<<<<< HEAD
     @partial(jax.jit, static_argnums=(0, 5))
     def compute_grad_data_fitting_term(self, params, data, f_MAP, theta_MAP, jvp_fn, factor=None):
         loss_fn = lambda p: self.CE_loss(p, data, f_MAP, theta_MAP, jvp_fn, factor)
+=======
+    def compute_grad_data_fitting_term(self, params, data, f_MAP):
+        loss_fn = lambda p: self.CE_loss(p, data, f_MAP)
+>>>>>>> e8a9642 (Merge from timo)
         grad_fn = grad(loss_fn)
         grad_params = grad_fn(params)
         return grad_params
@@ -653,25 +720,35 @@ class linearized_cross_entropy_manifold:
         grad_params = grad_fn(params)
         return grad_params
 
+<<<<<<< HEAD
     # @profile
+=======
+>>>>>>> e8a9642 (Merge from timo)
     def geodesic_system(self, current_point, velocity, return_hvp=False):
         # Convert current_point and velocity to parameter structures
         params = self.unravel_fn(current_point)
         velocity_params = self.unravel_fn(velocity)
 
+<<<<<<< HEAD
         param_info = precompute_param_info(self.model)
 
 
+=======
+>>>>>>> e8a9642 (Merge from timo)
         # Compute gradient of data fitting term
         if self.batching:
             grad_data_fitting_term = None
             for batch_x, batch_y, batch_f_MAP in self.X:
                 data = (batch_x, batch_y)
+<<<<<<< HEAD
                 def jvp_fn(p):
                     state = params_from_map_info(p, param_info)
                     return self.model.apply_fn(state.params, batch_x)
 
                 grad_per_batch = self.compute_grad_data_fitting_term(params, data, batch_f_MAP, self.theta_MAP, jvp_fn, self.factor)
+=======
+                grad_per_batch = self.compute_grad_data_fitting_term(params, data, batch_f_MAP)
+>>>>>>> e8a9642 (Merge from timo)
                 if grad_data_fitting_term is None:
                     grad_data_fitting_term = grad_per_batch
                 else:
@@ -680,11 +757,15 @@ class linearized_cross_entropy_manifold:
                     )
         else:
             data = (self.X, self.y)
+<<<<<<< HEAD
             def jvp_fn(p):
                 state = params_from_map_info(p, param_info)
                 return self.model.apply_fn(state["params"], self.X)
 
             grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP, self.theta_MAP, jvp_fn, self.factor)
+=======
+            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
+>>>>>>> e8a9642 (Merge from timo)
 
         # Compute gradient of L2 regularization
         grad_reg = self.compute_grad_L2_reg(params)
@@ -703,6 +784,7 @@ class linearized_cross_entropy_manifold:
             return self.CE_loss(p, data, self.f_MAP) + self.L2_norm(p)
 
         # Compute Hessian-vector product
+<<<<<<< HEAD
         # hvp_fn = lambda v: jax.jvp(grad(total_loss_fn), (params,), (v,))[1]
         jit_grad_total_loss_fn = jax.jit(grad(total_loss_fn))
 
@@ -711,12 +793,19 @@ class linearized_cross_entropy_manifold:
             _, hvp = jax.jvp(jit_grad_total_loss_fn, (params,), (v,))
             return hvp
         
+=======
+        hvp_fn = lambda v: jax.jvp(grad(total_loss_fn), (params,), (v,))[1]
+>>>>>>> e8a9642 (Merge from timo)
         hvp_params = hvp_fn(velocity_params)
         flat_hvp, _ = jax.flatten_util.ravel_pytree(hvp_params)
 
         # Compute second derivative
         denom = 1.0 + jnp.dot(flat_total_grad, flat_total_grad)
+<<<<<<< HEAD
         numerator = jnp.dot(velocity.flatten(), flat_hvp)
+=======
+        numerator = jnp.dot(velocity, flat_hvp)
+>>>>>>> e8a9642 (Merge from timo)
         second_derivative = - (flat_total_grad / denom) * numerator
 
         if return_hvp:

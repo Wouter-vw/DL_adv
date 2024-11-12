@@ -2,980 +2,589 @@
 File containing all the manifold we are going to use for the experiments:
 - Regression manifold
 - Linearized regression manifold
-- cross entropy manifold
-- linearized cross entropy manifold
+- Cross entropy manifold
+- Linearized cross entropy manifold
 """
 
-import torch
-from functorch import grad, jvp, make_functional, vjp, make_functional_with_buffers, hessian, jacfwd, jacrev, vmap
+import jax
+import jax.numpy as jnp
+from jax import grad, jvp, vjp, hessian, jacfwd, jacrev, vmap
 from functools import partial
-from functorch_utils import get_params_structure, stack_gradient, custum_hvp, stack_gradient2, stack_gradient3
-from torch.distributions import Normal
-from torch import nn
+import flax.linen as nn
 import numpy as np
 import math
 import time
 import copy
-
+import optax
 
 class regression_manifold:
-    def __init__(self, model, X, y, batching=False, lambda_reg=None, noise_var=1, device="cpu"):
+    def __init__(self, model, X, y, batching=False, lambda_reg=None, noise_var=1):
         self.model = model
-
         self.X = X
         self.y = y
         self.N = len(self.X)
-        self.n_params = len(torch.nn.utils.parameters_to_vector(self.model.parameters()))
-        self.batching = batching
         self.lambda_reg = lambda_reg
         self.noise_var = noise_var
-        self.device = device
+        self.batching = batching
 
         assert y is None if batching else True, "If batching is True, y should be None"
 
-        # these are just to avoid to have to pass them as input of the functions
-        # we use to compute the gradient and the hessian vector product
-        self.fmodel = None
-        self.buffers = None
+        # Initialize model parameters
+        rng = jax.random.PRNGKey(0)
+        dummy_input = self.X[0]
+        variables = self.model.init(rng, dummy_input)
+        self.params = variables['params']
+        self.n_params, self.unravel_fn = self.get_num_params(self.params)
+
+    def get_num_params(self, params):
+        flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
+        n_params = flat_params.shape[0]
+        return n_params, unravel_fn
 
     @staticmethod
     def is_diagonal():
         return False
 
-    def L2_norm(self, param):
-        """
-        L2 regularization. I need this separate from the loss for the gradient computation
-        """
-        w_norm = sum([sum(w.view(-1) ** 2) for w in param])
+    def L2_norm(self, params):
+        if self.lambda_reg is None:
+            return 0.0
+        w_norm = sum([jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params)])
         return self.lambda_reg * w_norm
 
-    def mse_loss(self, param, data):
-        # let's try to keep the prediction here without
+    def mse_loss(self, params, data):
         x, y = data
-        x = x.to(self.device)
-        y = y.to(self.device)
-        # defining a model
-        if self.model is None:
-            raise NotImplementedError("Compute usual prediction still have to be implemented")
-        else:
-            y_pred = self.fmodel(param, self.buffers, x)
-
-        criterion = torch.nn.MSELoss(reduction="sum")
-
-        return (1.0 / self.noise_var) * criterion(y_pred, y) * 0.5
+        y_pred = self.model.apply({'params': params}, x)
+        loss = 0.5 * (1.0 / self.noise_var) * jnp.sum((y_pred - y) ** 2)
+        return loss
 
     def compute_grad_data_fitting_term(self, params, data):
-        ft_compute_grad = grad(self.mse_loss)
-        # ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0))
-        # the input of this function is just the parameters, because
-        # we are accessing the data from the class
-        ft_per_sample_grads = ft_compute_grad(params, data)
-        return ft_per_sample_grads
+        loss_fn = lambda p: self.mse_loss(p, data)
+        grad_fn = grad(loss_fn)
+        grad_params = grad_fn(params)
+        return grad_params
 
     def compute_grad_L2_reg(self, params):
-        ft_compute_grad = grad(self.L2_norm)
-        # ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0))
-        # the input of this function is just the parameters, because
-        # we are accessing the data from the class
-        ft_per_sample_grads = ft_compute_grad(params)
-        return ft_per_sample_grads
+        if self.lambda_reg is None:
+            return None
+        reg_fn = lambda p: self.L2_norm(p)
+        grad_fn = grad(reg_fn)
+        grad_params = grad_fn(params)
+        return grad_params
 
     def geodesic_system(self, current_point, velocity, return_hvp=False):
-        # check if they are numpy array or torch.Tensor
-        # here we need torch tensor to perform these operations
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float().to(self.device)
+        # Convert current_point and velocity to parameter structures
+        params = self.unravel_fn(current_point)
+        velocity_params = self.unravel_fn(velocity)
 
-        if not isinstance(velocity, torch.Tensor):
-            velocity = torch.from_numpy(velocity).float().to(self.device)
-
-        # I would expect both current point and velocity to be
-        # two vectors of shape n_params
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
+        # Compute gradient of data fitting term
+        if self.batching:
+            # Compute gradient over batches
+            grad_data_fitting_term = None
+            for batch_x, batch_y in self.X:
+                data = (batch_x, batch_y)
+                grad_per_batch = self.compute_grad_data_fitting_term(params, data)
+                if grad_data_fitting_term is None:
+                    grad_data_fitting_term = grad_per_batch
+                else:
+                    grad_data_fitting_term = jax.tree_util.tree_map(
+                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
+                    )
         else:
-            batchify = False
             data = (self.X, self.y)
+            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data)
 
-        # let's start by putting the current points into the model
-        torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-
-        self.model.zero_grad()
-        # now I have to call the functorch function
-        self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-        # and I have to reshape the velocity into being the same structure as the params
-        vel_as_params = get_params_structure(velocity, params)
-
-        # now I have everything to compute the the second derivative
-        # let's compute the gradient
-        grad_data_fitting_term = 0
-        if batchify:
-            for batch_img, batch_label in self.X:
-                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label))
-                grad_data_fitting_term += stack_gradient3(grad_per_example, self.n_params).view(-1, 1)
-        else:
-            grad_per_example = self.compute_grad_data_fitting_term(params, data)
-            grad_per_example = stack_gradient3(grad_per_example, self.n_params)
-            grad_data_fitting_term = grad_per_example.view(-1, 1)
-
-        if self.lambda_reg is not None:
-            # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
-        else:
-            grad_reg = 0
-
-        tot_gradient = grad_data_fitting_term + grad_reg
-        if batchify:
-            hvp = 0
-            for batch_img, batch_label in self.X:
-                _, result = custum_hvp(
-                    self.mse_loss,
-                    (params, (batch_img, batch_label)),
-                    (vel_as_params, (torch.zeros_like(batch_img), torch.zeros_like(batch_label))),
-                )
-                hvp += torch.cat([sub_prod.flatten() for sub_prod in result])
-        else:
-            _, result = custum_hvp(
-                self.mse_loss, (params, data), (vel_as_params, (torch.zeros_like(data[0]), torch.zeros_like(data[1])))
+        # Compute gradient of L2 regularization
+        grad_reg = self.compute_grad_L2_reg(params)
+        if grad_reg is not None:
+            total_grad = jax.tree_util.tree_map(
+                lambda x, y: x + y, grad_data_fitting_term, grad_reg
             )
-            hvp = [sub_prod.flatten() for sub_prod in result]
-            hvp = torch.cat(hvp)
+        else:
+            total_grad = grad_data_fitting_term
 
-        if self.lambda_reg is not None:
-            hvp_reg = 2 * self.lambda_reg * velocity
+        # Flatten total gradient
+        flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
 
-            hvp = hvp + hvp_reg.view(-1)
+        # Define total loss function
+        def total_loss_fn(p):
+            return self.mse_loss(p, data) + self.L2_norm(p)
 
-        second_derivative = -((tot_gradient / (1 + tot_gradient.T @ tot_gradient)) * (velocity.T @ hvp)).flatten()
+        # Compute Hessian-vector product
+        hvp_fn = lambda v: jax.jvp(grad(total_loss_fn), (params,), (v,))[1]
+        hvp_params = hvp_fn(velocity_params)
+        flat_hvp, _ = jax.flatten_util.ravel_pytree(hvp_params)
+
+        # Compute second derivative
+        denom = 1.0 + jnp.dot(flat_total_grad, flat_total_grad)
+        numerator = jnp.dot(velocity, flat_hvp)
+        second_derivative = - (flat_total_grad / denom) * numerator
 
         if return_hvp:
-            return second_derivative.view(-1, 1).detach().numpy(), hvp.view(-1, 1).detach().numpy()
+            return second_derivative, flat_hvp
         else:
-            return second_derivative.view(-1, 1).detach().numpy()
+            return second_derivative
 
     def get_gradient_value_in_specific_point(self, current_point):
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
+        # Convert current_point to parameter structure
+        params = self.unravel_fn(current_point)
+
+        if self.batching:
+            grad_data_fitting_term = None
+            for batch_x, batch_y in self.X:
+                data = (batch_x, batch_y)
+                grad_per_batch = self.compute_grad_data_fitting_term(params, data)
+                if grad_data_fitting_term is None:
+                    grad_data_fitting_term = grad_per_batch
+                else:
+                    grad_data_fitting_term = jax.tree_util.tree_map(
+                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
+                    )
         else:
-            batchify = False
             data = (self.X, self.y)
+            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data)
 
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float()
-
-        current_point = current_point.to(self.device)
-        assert (
-            len(current_point) == self.n_params
-        ), "You are passing a larger vector than the number of weights in the model"
-
-        torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-
-        self.model.zero_grad()
-        self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-        grad_data_fitting_term = 0
-        if batchify:
-            for batch_img, batch_label in self.X:
-                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label))
-                grad_data_fitting_term += stack_gradient3(grad_per_example, self.n_params).view(-1, 1)
+        grad_reg = self.compute_grad_L2_reg(params)
+        if grad_reg is not None:
+            total_grad = jax.tree_util.tree_map(
+                lambda x, y: x + y, grad_data_fitting_term, grad_reg
+            )
         else:
-            grad_per_example = self.compute_grad_data_fitting_term(params, data)
-            grad_per_example = stack_gradient3(grad_per_example, self.n_params)
-            grad_data_fitting_term = grad_per_example.view(-1, 1)
+            total_grad = grad_data_fitting_term
 
-        if self.lambda_reg is not None:
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
-        else:
-            grad_reg = 0
-
-        tot_gradient = grad_data_fitting_term + grad_reg
-        tot_gradient = tot_gradient.to(self.device)
-
-        return tot_gradient
+        flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
+        return flat_total_grad
 
 
-# linearized regression manifold
+# Linearized regression manifold
 class linearized_regression_manifold:
-    def __init__(
-        self, model, X, y, f_MAP, J_f_MAP, theta_MAP, batching=False, lambda_reg=None, noise_var=1, device="cpu"
-    ):
+    def __init__(self, model, X, y, f_MAP, theta_MAP, batching=False, lambda_reg=None, noise_var=1):
         self.model = model
-
         self.X = X
         self.y = y
         self.N = len(self.X)
-        self.n_params = len(torch.nn.utils.parameters_to_vector(self.model.parameters()))
-        self.batching = batching
         self.lambda_reg = lambda_reg
         self.noise_var = noise_var
-        self.device = device
-        self.f_MAP = f_MAP
-        self.J_f_MAP = J_f_MAP
+        self.batching = batching
         self.theta_MAP = theta_MAP
+        self.f_MAP = f_MAP
 
         assert y is None if batching else True, "If batching is True, y should be None"
 
-        # these are just to avoid to have to pass them as input of the functions
-        # we use to compute the gradient and the hessian vector product
-        self.fmodel = None
-        self.buffers = None
+        # Initialize model parameters
+        self.params = theta_MAP
+        self.n_params, self.unravel_fn = self.get_num_params(self.params)
 
-        self.fmodel_map = None
-        self.params_map = None
-        self.buffers_map = None
+    def get_num_params(self, params):
+        flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
+        n_params = flat_params.shape[0]
+        return n_params, unravel_fn
 
     @staticmethod
     def is_diagonal():
         return False
 
-    def L2_norm(self, param):
-        """
-        L2 regularization. I need this separate from the loss for the gradient computation
-        """
-        w_norm = sum([sum(w.view(-1) ** 2) for w in param])
+    def L2_norm(self, params):
+        if self.lambda_reg is None:
+            return 0.0
+        w_norm = sum([jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params)])
         return self.lambda_reg * w_norm
 
-    def mse_loss(self, param, data, f_MAP):
-        def predict(params, datas):
-            y_preds = self.fmodel_map(params, self.buffers_map, datas)
-            return y_preds
-
+    def mse_loss(self, params, data, f_MAP):
         x, y = data
-        x = x.to(self.device)
-        y = y.to(self.device)
-
-        # jvp computation
-        params_map = get_params_structure(self.theta_MAP, param)
-        diff_weights = []
-        for i in range(len(param)):
-            diff_weights.append(param[i] - params_map[i])
-        diff_weights = tuple(diff_weights)
-
-        _, jvp_value = jvp(predict, (self.params_map, x), (diff_weights, torch.zeros_like(x)), strict=False)
-
+        # Compute difference between params and theta_MAP
+        diff_params = jax.tree_util.tree_map(lambda a, b: a - b, params, self.theta_MAP)
+        # Compute jvp
+        _, jvp_value = jvp(lambda p: self.model.apply({'params': p}, x), (self.theta_MAP,), (diff_params,))
         y_pred = f_MAP + jvp_value
-
-        criterion = torch.nn.MSELoss(reduction="sum")
-
-        return (1.0 / self.noise_var) * criterion(y_pred, y) * 0.5
+        loss = 0.5 * (1.0 / self.noise_var) * jnp.sum((y_pred - y) ** 2)
+        return loss
 
     def compute_grad(self, params, data, f_MAP):
-        ft_compute_grad = grad(self.mse_loss)
-        ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0, 0))
-
-        # the input of this function is just the parameters, because
-        # we are accessing the data from the class
-        gradw = ft_compute_sample_grad(params, data, f_MAP)
-        return gradw
+        loss_fn = lambda p: self.mse_loss(p, data, f_MAP)
+        grad_fn = grad(loss_fn)
+        grad_params = grad_fn(params)
+        return grad_params
 
     def compute_grad_L2_reg(self, params):
-        ft_compute_grad = grad(self.L2_norm)
-        # ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0))
-        # the input of this function is just the parameters, because
-        # we are accessing the data from the class
-        ft_per_sample_grads = ft_compute_grad(params)
-        return ft_per_sample_grads
+        if self.lambda_reg is None:
+            return None
+        reg_fn = lambda p: self.L2_norm(p)
+        grad_fn = grad(reg_fn)
+        grad_params = grad_fn(params)
+        return grad_params
 
     def geodesic_system(self, current_point, velocity, return_hvp=False):
-        # check if they are numpy array or torch.Tensor
-        # here we need torch tensor to perform these operations
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float().to(self.device)
+        # Convert current_point and velocity to parameter structures
+        params = self.unravel_fn(current_point)
+        velocity_params = self.unravel_fn(velocity)
 
-        if not isinstance(velocity, torch.Tensor):
-            velocity = torch.from_numpy(velocity).float().to(self.device)
-
-        # two vectors of shape n_params
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
-
+        # Compute gradient of data fitting term
+        if self.batching:
+            grad_data_fitting_term = None
+            for batch_x, batch_y, batch_f_MAP in self.X:
+                data = (batch_x, batch_y)
+                grad_per_batch = self.compute_grad(params, data, batch_f_MAP)
+                if grad_data_fitting_term is None:
+                    grad_data_fitting_term = grad_per_batch
+                else:
+                    grad_data_fitting_term = jax.tree_util.tree_map(
+                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
+                    )
         else:
-            batchify = False
             data = (self.X, self.y)
+            grad_data_fitting_term = self.compute_grad(params, data, self.f_MAP)
 
-        # now I have everything to compute the the second derivative
-        # let's compute the gradient
-        grad_data_fitting_term = 0
-        if batchify:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            for batch_img, batch_label, batch_MAP in self.X:
-                grad_per_example = self.compute_grad(params, (batch_img, batch_label), batch_MAP)
-                grad_data_fitting_term += stack_gradient2(grad_per_example, self.n_params).view(-1, 1)
-
-        else:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            data = (self.X, self.y)
-
-            grad_per_example = self.compute_grad(params, data, self.f_MAP)
-
-            gradw = stack_gradient2(grad_per_example, self.n_params)
-            grad_data_fitting_term = gradw.view(-1, 1)
-
-        if self.lambda_reg is not None:
-            # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
-
-        else:
-            grad_reg = 0
-
-        tot_gradient = grad_data_fitting_term + grad_reg
-
-        # now I have also to compute the Hvp between hessian and velocity
-
-        vel_as_params = get_params_structure(velocity, params)
-
-        if batchify:
-            hvp = 0
-
-            for batch_img, batch_label, batch_f_MAP in self.X:
-                _, result = custum_hvp(
-                    self.mse_loss,
-                    (params, (batch_img, batch_label), batch_f_MAP),
-                    (
-                        vel_as_params,
-                        (torch.zeros_like(batch_img), torch.zeros_like(batch_label)),
-                        torch.zeros_like(batch_f_MAP),
-                    ),
-                )
-
-                hvp += torch.cat([sub_prod.flatten() for sub_prod in result])
-        else:
-            _, result = custum_hvp(
-                self.mse_loss,
-                (params, data, self.f_MAP),
-                (vel_as_params, (torch.zeros_like(data[0]), torch.zeros_like(data[1])), torch.zeros_like(self.f_MAP)),
+        # Compute gradient of L2 regularization
+        grad_reg = self.compute_grad_L2_reg(params)
+        if grad_reg is not None:
+            total_grad = jax.tree_util.tree_map(
+                lambda x, y: x + y, grad_data_fitting_term, grad_reg
             )
-
-            hvp = [sub_prod.flatten() for sub_prod in result]
-            hvp = torch.cat(hvp)
-
-        if self.lambda_reg is not None:
-            hvp_reg = 2 * self.lambda_reg * velocity
-            tot_hvp = hvp + hvp_reg.view(-1)
         else:
-            tot_hvp = hvp
+            total_grad = grad_data_fitting_term
 
-        tot_gradient = tot_gradient.detach()
-        tot_hvp = tot_hvp.detach()
+        # Flatten total gradient
+        flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
 
-        second_derivative = -((tot_gradient / (1 + tot_gradient.T @ tot_gradient)) * (velocity.T @ tot_hvp)).flatten()
+        # Define total loss function
+        def total_loss_fn(p):
+            return self.mse_loss(p, data, self.f_MAP) + self.L2_norm(p)
+
+        # Compute Hessian-vector product
+        hvp_fn = lambda v: jax.jvp(grad(total_loss_fn), (params,), (v,))[1]
+        hvp_params = hvp_fn(velocity_params)
+        flat_hvp, _ = jax.flatten_util.ravel_pytree(hvp_params)
+
+        # Compute second derivative
+        denom = 1.0 + jnp.dot(flat_total_grad, flat_total_grad)
+        numerator = jnp.dot(velocity, flat_hvp)
+        second_derivative = - (flat_total_grad / denom) * numerator
 
         if return_hvp:
-            return second_derivative.view(-1, 1).detach().numpy(), tot_hvp.view(-1, 1).detach().numpy()
+            return second_derivative, flat_hvp
         else:
-            return second_derivative.view(-1, 1).detach().numpy()
+            return second_derivative
 
     def get_gradient_value_in_specific_point(self, current_point):
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
+        # Convert current_point to parameter structure
+        params = self.unravel_fn(current_point)
+
+        if self.batching:
+            grad_data_fitting_term = None
+            for batch_x, batch_y, batch_f_MAP in self.X:
+                data = (batch_x, batch_y)
+                grad_per_batch = self.compute_grad(params, data, batch_f_MAP)
+                if grad_data_fitting_term is None:
+                    grad_data_fitting_term = grad_per_batch
+                else:
+                    grad_data_fitting_term = jax.tree_util.tree_map(
+                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
+                    )
         else:
-            batchify = False
             data = (self.X, self.y)
+            grad_data_fitting_term = self.compute_grad(params, data, self.f_MAP)
 
-        if self.fmodel_map is None:
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-        # method to return the gradient of the loss in a specific point
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float()
-
-        current_point = current_point.to(self.device)
-        assert (
-            len(current_point) == self.n_params
-        ), "You are passing a larger vector than the number of weights in the model"
-
-        torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-
-        self.model.zero_grad()
-
-        self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-        grad_data_fitting_term = 0
-        if batchify:
-            gradw = 0
-            for batch_img, batch_label, batch_MAP in self.X:
-                grad_per_example = self.compute_grad(params, (batch_img, batch_label), batch_MAP)
-                grad_data_fitting_term += stack_gradient2(grad_per_example, self.n_params).view(-1, 1)
+        grad_reg = self.compute_grad_L2_reg(params)
+        if grad_reg is not None:
+            total_grad = jax.tree_util.tree_map(
+                lambda x, y: x + y, grad_data_fitting_term, grad_reg
+            )
         else:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
+            total_grad = grad_data_fitting_term
 
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            data = (self.X, self.y)
-            grad_per_example = self.compute_grad(params, data, self.f_MAP)
-
-            gradw = stack_gradient2(grad_per_example, self.n_params)
-            grad_data_fitting_term = gradw.view(-1, 1)
-
-        if self.lambda_reg is not None:
-            # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
-        else:
-            grad_reg = 0
-
-        tot_gradient = grad_data_fitting_term + grad_reg
-
-        tot_gradient = tot_gradient.to(self.device)
-
-        return tot_gradient
+        flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
+        return flat_total_grad
 
 
 class cross_entropy_manifold:
-    """
-    Also in this case I have to split the gradient loss computation and the gradient of the regularization
-    term.
-    This is needed to get the correct gradient and hessian computation when using batches.
-    """
-
-    def __init__(
-        self, model, X, y, batching=False, device="cpu", lambda_reg=None, type="fc", N=None, B1=None, B2=None
-    ):
+    def __init__(self, model, X, y, batching=False, lambda_reg=None, N=None, B1=None, B2=None):
         self.model = model
-
         self.X = X
         self.y = y
         self.N = len(self.X)
-        self.n_params = len(torch.nn.utils.parameters_to_vector(self.model.parameters()))
-        self.batching = batching
-        self.device = device
-        self.type = type
-        # self.prior_precision = prior_precision
         self.lambda_reg = lambda_reg
-        assert y is None if batching else True, "If batching is True, y should be None"
-
-        # these are just to avoid to have to pass them as input of the functions
-        # we use to compute the gradient and the hessian vector product
-        self.fmodel = None
-        self.buffers = None
-
-        ## stuff we need when using barches
+        self.batching = batching
         self.N = N
         self.B1 = B1
         self.B2 = B2
         self.factor = None
-
-        # here I can already compute the factor_loss
         if self.B1 is not None:
             self.factor = N / B1
             if self.B2 is not None:
-                self.factor = self.factor * (B2 / B1)
+                self.factor *= (B2 / B1)
+
+        # Initialize model parameters
+        rng = jax.random.PRNGKey(0)
+        dummy_input = self.X[0]
+        # variables = self.model.init(rng, dummy_input)
+        # self.params = variables['params']
+        self.params = self.model.params
+        self.n_params, self.unravel_fn = self.get_num_params(self.params)
+
+    def get_num_params(self, params):
+        flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
+        n_params = flat_params.shape[0]
+        return n_params, unravel_fn
 
     @staticmethod
     def is_diagonal():
         return False
 
-    def CE_loss(self, param, data):
-        """
-        Data fitting term of the loss
-        """
+    def CE_loss(self, params, data):
         x, y = data
-        x = x.to(self.device)
-        y = y.to(self.device)
+        logits = self.model.apply_fn(params, x) #{'params': params}
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+        loss = jnp.sum(loss)
+        if self.factor is not None:
+            loss *= self.factor
+        return loss
 
-        if self.type != "fc":
-            # assuming input for con
-            x = x.unsqueeze(1)
-
-        if self.model is None:
-            raise NotImplementedError("Compute usual prediction still have to be implemented")
-        else:
-            # self.fmodel.eval()
-            y_pred = self.fmodel(param, self.buffers, x)
-
-        criterion = torch.nn.CrossEntropyLoss(reduction="sum")
-
-        if self.type == "fc":
-            if self.factor is not None:
-                return self.factor * criterion(y_pred, y)
-            else:
-                return criterion(y_pred, y)
-        else:
-            if self.factor is not None:
-                return self.factor * criterion(y_pred.view(-1), y)
-            else:
-                return criterion(y_pred.view(-1), y)
-
-    def L2_norm(self, param):
-        """
-        L2 regularization. I need this separate from the loss for the gradient computation
-        """
-        w_norm = sum([sum(w.view(-1) ** 2) for w in param])
+    def L2_norm(self, params):
+        if self.lambda_reg is None:
+            return 0.0
+        w_norm = sum([jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params)])
         return self.lambda_reg * w_norm
 
     def compute_grad_data_fitting_term(self, params, data):
-        # TODO: understand how to make vmap work without passing the data
-        ft_compute_grad = grad(self.CE_loss)
-        # ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0))
-        # the input of this function is just the parameters, because
-        # we are accessing the data from the class
-        ft_per_sample_grads = ft_compute_grad(params, data)
-        return ft_per_sample_grads
+        loss_fn = lambda p: self.CE_loss(p, data)
+        grad_fn = grad(loss_fn)
+        grad_params = grad_fn(params)
+        return grad_params
 
     def compute_grad_L2_reg(self, params):
-        ft_compute_grad = grad(self.L2_norm)
-
-        ft_per_sample_grads = ft_compute_grad(params)
-        return ft_per_sample_grads
+        if self.lambda_reg is None:
+            return None
+        reg_fn = lambda p: self.L2_norm(p)
+        grad_fn = grad(reg_fn)
+        grad_params = grad_fn(params)
+        return grad_params
 
     def geodesic_system(self, current_point, velocity, return_hvp=False):
-        # check if they are numpy array or torch.Tensor
-        # here we need torch tensor to perform these operations
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float().to(self.device)
+        # Convert current_point and velocity to parameter structures
+        params = self.unravel_fn(current_point)
+        velocity_params = self.unravel_fn(velocity)
 
-        if not isinstance(velocity, torch.Tensor):
-            velocity = torch.from_numpy(velocity).float().to(self.device)
-
-        # I would expect both current point and velocity to be
-        # two vectors of shape n_params
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
-        else:
-            batchify = False
-            data = (self.X, self.y)
-
-        # let's start by putting the current points into the model
-        torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-
-        self.model.zero_grad()
-
-        self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-        # and I have to reshape the velocity into being the same structure as the params
-        vel_as_params = get_params_structure(velocity, params)
-
-        # now I have everything to compute the the second derivative
-        # let's compute the gradient
-        start = time.time()
-        grad_data_fitting_term = 0
-        if batchify:
-            for batch_img, batch_label in self.X:
-                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label))
-                grad_data_fitting_term += stack_gradient3(grad_per_example, self.n_params).view(-1, 1)
-        else:
-            grad_per_example = self.compute_grad_data_fitting_term(params, data)
-            gradw = stack_gradient3(grad_per_example, self.n_params)
-            grad_data_fitting_term = gradw.view(-1, 1)
-        end = time.time()
-
-        # now I have to compute the gradient of the regularization term
-        if self.lambda_reg is not None:
-            # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
-        else:
-            grad_reg = 0
-
-        tot_gradient = grad_data_fitting_term + grad_reg
-
-        # now I have also to compute the Hvp between hessian and velocity
-        start = time.time()
-        if batchify:
-            hvp_data_fitting = 0
-            for batch_img, batch_label in self.X:
-                if self.type == "fc":
-                    _, result = custum_hvp(
-                        self.CE_loss,
-                        (params, (batch_img, batch_label)),
-                        (vel_as_params, (torch.zeros_like(batch_img), torch.zeros_like(batch_label))),
-                    )
+        # Compute gradient of data fitting term
+        if self.batching:
+            grad_data_fitting_term = None
+            for batch_x, batch_y in self.X:
+                data = (batch_x, batch_y)
+                grad_per_batch = self.compute_grad_data_fitting_term(params, data)
+                if grad_data_fitting_term is None:
+                    grad_data_fitting_term = grad_per_batch
                 else:
-                    print("If you are getting an error, before here I was using self.CE_loss2, so double check that")
-                    _, result = custum_hvp(
-                        self.CE_loss,
-                        (params, (batch_img, batch_label)),
-                        (vel_as_params, (torch.zeros_like(batch_img), torch.zeros_like(batch_label))),
+                    grad_data_fitting_term = jax.tree_util.tree_map(
+                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
                     )
-                hvp_data_fitting += torch.cat([sub_prod.flatten() for sub_prod in result])
         else:
-            _, result = custum_hvp(
-                self.CE_loss, (params, data), (vel_as_params, (torch.zeros_like(data[0]), torch.zeros_like(data[1])))
+            data = (self.X, self.y)
+            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data)
+
+        # Compute gradient of L2 regularization
+        grad_reg = self.compute_grad_L2_reg(params)
+        if grad_reg is not None:
+            total_grad = jax.tree_util.tree_map(
+                lambda x, y: x + y, grad_data_fitting_term, grad_reg
             )
-            hvp = [sub_prod.flatten() for sub_prod in result]
-            hvp_data_fitting = torch.cat(hvp)
-
-        if self.lambda_reg is not None:
-            hvp_reg = 2 * self.lambda_reg * velocity
-            tot_hvp = hvp_data_fitting + hvp_reg.view(-1)
         else:
-            tot_hvp = hvp_data_fitting
+            total_grad = grad_data_fitting_term
 
-        tot_hvp = tot_hvp.to(self.device)
-        tot_gradient = tot_gradient.to(self.device)
-        end = time.time()
+        # Flatten total gradient
+        flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
 
-        second_derivative = -((tot_gradient / (1 + tot_gradient.T @ tot_gradient)) * (velocity.T @ tot_hvp)).flatten()
+        # Define total loss function
+        def total_loss_fn(p):
+            return self.CE_loss(p, data) + self.L2_norm(p)
+
+        # Compute Hessian-vector product
+        hvp_fn = lambda v: jax.jvp(grad(total_loss_fn), (params,), (v,))[1]
+        hvp_params = hvp_fn(velocity_params)
+        flat_hvp, _ = jax.flatten_util.ravel_pytree(hvp_params)
+
+        # Compute second derivative
+        denom = 1.0 + jnp.dot(flat_total_grad, flat_total_grad)
+        numerator = jnp.dot(velocity.squeeze(), flat_hvp)
+        second_derivative = - (flat_total_grad / denom) * numerator
 
         if return_hvp:
-            return second_derivative.view(-1, 1).detach().cpu().numpy(), tot_hvp.view(-1, 1).detach().cpu().numpy()
+            return second_derivative, flat_hvp
         else:
-            return second_derivative.view(-1, 1).detach().cpu().numpy()
+            return second_derivative
 
     def get_gradient_value_in_specific_point(self, current_point):
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
-        else:
-            batchify = False
-            data = (self.X, self.y)
+        # Convert current_point to parameter structure
+        params = self.unravel_fn(current_point)
 
-        # method to return the gradient of the loss in a specific point
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float()
-
-        current_point = current_point.to(self.device)
-        assert (
-            len(current_point) == self.n_params
-        ), "You are passing a larger vector than the number of weights in the model"
-        self.model.zero_grad()
-
-        self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-        grad_data_fitting_term = 0
         if self.batching:
-            for batch_img, batch_label in self.X:
-                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label))
-                grad_data_fitting_term += stack_gradient3(grad_per_example, self.n_params).view(-1, 1)
+            grad_data_fitting_term = None
+            for batch_x, batch_y in self.X:
+                data = (batch_x, batch_y)
+                grad_per_batch = self.compute_grad_data_fitting_term(params, data)
+                if grad_data_fitting_term is None:
+                    grad_data_fitting_term = grad_per_batch
+                else:
+                    grad_data_fitting_term = jax.tree_util.tree_map(
+                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
+                    )
         else:
             data = (self.X, self.y)
-            grad_per_example = self.compute_grad_data_fitting_term(params, data)
+            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data)
 
-            gradw = stack_gradient3(grad_per_example, self.n_params)
-            grad_data_fitting_term = gradw.view(-1, 1)
-
-        # now I have to compute the regularization term
-        if self.lambda_reg is not None:
-            # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
+        grad_reg = self.compute_grad_L2_reg(params)
+        if grad_reg is not None:
+            total_grad = jax.tree_util.tree_map(
+                lambda x, y: x + y, grad_data_fitting_term, grad_reg
+            )
         else:
-            grad_reg = 0
+            total_grad = grad_data_fitting_term
 
-        tot_gradient = grad_data_fitting_term + grad_reg
-        tot_gradient = tot_gradient.to(self.device)
-
-        return tot_gradient
+        flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
+        return flat_total_grad
 
 
 class linearized_cross_entropy_manifold:
-    """
-    Also in this case I have to separate data fitting term and regularization term for gradient and
-    hessian computation in case of batches.
-    """
-
-    def __init__(
-        self,
-        model,
-        X,
-        y,
-        f_MAP,
-        theta_MAP,
-        batching=False,
-        device="cpu",
-        lambda_reg=None,
-        type="fc",
-        N=None,
-        B1=None,
-        B2=None,
-    ):
+    def __init__(self, model, X, y, f_MAP, theta_MAP, batching=False, lambda_reg=None, N=None, B1=None, B2=None):
         self.model = model
-        # TODO: decide if it is better to pass X and Y or
-        # pass data that is either data = (X,y) or a dataloader
         self.X = X
         self.y = y
         self.N = len(self.X)
-        self.n_params = len(torch.nn.utils.parameters_to_vector(self.model.parameters()))
-        self.batching = batching
-        self.device = device
-        self.type = type
-        # self.prior_precision = prior_precision
         self.lambda_reg = lambda_reg
-        assert y is None if batching else True, "If batching is True, y should be None"
-
+        self.batching = batching
         self.theta_MAP = theta_MAP
         self.f_MAP = f_MAP
-
-        # these are just to avoid to have to pass them as input of the functions
-        # we use to compute the gradient and the hessian vector product
-        self.fmodel = None
-        self.buffers = None
-
-        self.fmodel_map = None
-        self.params_map = None
-        self.buffers_map = None
-
         self.N = N
         self.B1 = B1
         self.B2 = B2
         self.factor = None
-
         if self.B1 is not None:
             self.factor = N / B1
             if self.B2 is not None:
-                self.factor = self.factor * (B2 / B1)
+                self.factor *= (B2 / B1)
+
+        # Initialize model parameters
+        self.params = theta_MAP
+        self.n_params, self.unravel_fn = self.get_num_params(self.params)
+
+    def get_num_params(self, params):
+        flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
+        n_params = flat_params.shape[0]
+        return n_params, unravel_fn
 
     @staticmethod
     def is_diagonal():
         return False
 
-    def CE_loss(self, param, data, f_MAP):
-        """
-        Data fitting term of the loss
-        """
-
-        def predict(params, datas):
-            y_preds = self.fmodel_map(params, self.buffers_map, datas)
-            return y_preds
-
+    def CE_loss(self, params, data, f_MAP):
         x, y = data
-        x = x.to(self.device)
-        y = y.to(self.device)
+        # Compute difference between params and theta_MAP
+        diff_params = jax.tree_util.tree_map(lambda a, b: a - b, params, self.theta_MAP)
+        # Compute jvp
+        _, jvp_value = jvp(lambda p: self.model.apply({'params': p}, x), (self.theta_MAP,), (diff_params,))
+        logits = f_MAP + jvp_value
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+        loss = jnp.sum(loss)
+        if self.factor is not None:
+            loss *= self.factor
+        return loss
 
-        if self.type != "fc":
-            x = x.unsqueeze(1)
-
-        params_map = get_params_structure(self.theta_MAP, param)
-        diff_weights = []
-        for i in range(len(param)):
-            diff_weights.append(param[i] - self.params_map[i])
-        diff_weights = tuple(diff_weights)
-        _, jvp_value = jvp(predict, (params_map, x), (diff_weights, torch.zeros_like(x)), strict=False)
-
-        y_pred = f_MAP + jvp_value
-
-        criterion = torch.nn.CrossEntropyLoss(reduction="sum")
-
-        if self.type == "fc":
-            if self.factor is not None:
-                return self.factor * criterion(y_pred, y)
-            else:
-                return criterion(y_pred, y)
-        else:
-            if self.factor is not None:
-                return self.factor * criterion(y_pred.view(-1), y)
-            else:
-                return criterion(y_pred.view(-1), y)
-
-    def L2_norm(self, param):
-        """
-        L2 regularization. I need this separate from the loss for the gradient computation
-        """
-        w_norm = sum([sum(w.view(-1) ** 2) for w in param])
+    def L2_norm(self, params):
+        if self.lambda_reg is None:
+            return 0.0
+        w_norm = sum([jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params)])
         return self.lambda_reg * w_norm
 
     def compute_grad_data_fitting_term(self, params, data, f_MAP):
-        # TODO: understand how to make vmap work without passing the data
-        ft_compute_grad = grad(self.CE_loss)
-        # ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0, 0))
-        # the input of this function is just the parameters, because
-        # we are accessing the data from the class
-        ft_per_sample_grads = ft_compute_grad(params, data, f_MAP)
-        return ft_per_sample_grads
+        loss_fn = lambda p: self.CE_loss(p, data, f_MAP)
+        grad_fn = grad(loss_fn)
+        grad_params = grad_fn(params)
+        return grad_params
 
     def compute_grad_L2_reg(self, params):
-        ft_compute_grad = grad(self.L2_norm)
-        # ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0))
-        # the input of this function is just the parameters, because
-        # we are accessing the data from the class
-        ft_per_sample_grads = ft_compute_grad(params)
-        return ft_per_sample_grads
+        if self.lambda_reg is None:
+            return None
+        reg_fn = lambda p: self.L2_norm(p)
+        grad_fn = grad(reg_fn)
+        grad_params = grad_fn(params)
+        return grad_params
 
     def geodesic_system(self, current_point, velocity, return_hvp=False):
-        # check if they are numpy array or torch.Tensor
-        # here we need torch tensor to perform these operations
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float().to(self.device)
+        # Convert current_point and velocity to parameter structures
+        params = self.unravel_fn(current_point)
+        velocity_params = self.unravel_fn(velocity)
 
-        if not isinstance(velocity, torch.Tensor):
-            velocity = torch.from_numpy(velocity).float().to(self.device)
-
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
-        else:
-            batchify = False
-            data = (self.X, self.y)
-
-        # let's start by putting the current points into the model
-        torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-
-        # now I have everything to compute the the second derivative
-        # let's compute the gradient
-        start = time.time()
-        grad_data_fitting_term = 0
-        if batchify:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            for batch_img, batch_label, batch_MAP in self.X:
-                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label), batch_MAP)
-                grad_data_fitting_term += stack_gradient3(grad_per_example, self.n_params).view(-1, 1)
-        else:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            grad_per_example = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
-            gradw = stack_gradient3(grad_per_example, self.n_params)
-            grad_data_fitting_term = gradw.view(-1, 1)
-        end = time.time()
-
-        # here now I have to compute also the gradient of the regularization term
-        if self.lambda_reg is not None:
-            # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
-
-        else:
-            grad_reg = 0
-
-        tot_gradient = grad_data_fitting_term + grad_reg
-
-        vel_as_params = get_params_structure(velocity, params)
-
-        start = time.time()
-        hvp_data_fitting = 0
-        if batchify:
-            for batch_img, batch_label, batch_f_MAP in self.X:
-                if self.type == "fc":
-                    _, result = custum_hvp(
-                        self.CE_loss,
-                        (params, (batch_img, batch_label), batch_f_MAP),
-                        (
-                            vel_as_params,
-                            (torch.zeros_like(batch_img), torch.zeros_like(batch_label)),
-                            torch.zeros_like(batch_f_MAP),
-                        ),
-                    )
+        # Compute gradient of data fitting term
+        if self.batching:
+            grad_data_fitting_term = None
+            for batch_x, batch_y, batch_f_MAP in self.X:
+                data = (batch_x, batch_y)
+                grad_per_batch = self.compute_grad_data_fitting_term(params, data, batch_f_MAP)
+                if grad_data_fitting_term is None:
+                    grad_data_fitting_term = grad_per_batch
                 else:
-                    _, result = custum_hvp(
-                        self.CE_loss,
-                        (params, (batch_img, batch_label), batch_f_MAP),
-                        (
-                            vel_as_params,
-                            (torch.zeros_like(batch_img), torch.zeros_like(batch_label)),
-                            torch.zeros_like(batch_f_MAP),
-                        ),
+                    grad_data_fitting_term = jax.tree_util.tree_map(
+                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
                     )
-
-                hvp_data_fitting += torch.cat([sub_prod.flatten() for sub_prod in result])
         else:
-            _, result = custum_hvp(
-                self.CE_loss,
-                (params, data, self.f_MAP),
-                (vel_as_params, (torch.zeros_like(data[0]), torch.zeros_like(data[1])), torch.zeros_like(self.f_MAP)),
+            data = (self.X, self.y)
+            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
+
+        # Compute gradient of L2 regularization
+        grad_reg = self.compute_grad_L2_reg(params)
+        if grad_reg is not None:
+            total_grad = jax.tree_util.tree_map(
+                lambda x, y: x + y, grad_data_fitting_term, grad_reg
             )
-
-            hvp = [sub_prod.flatten() for sub_prod in result]
-            hvp_data_fitting = torch.cat(hvp)
-
-        # I have to add the hvp of the regularization term
-        if self.lambda_reg is not None:
-            hvp_reg = 2 * self.lambda_reg * velocity
-
-            tot_hvp = hvp_data_fitting + hvp_reg.view(-1)
         else:
-            tot_hvp = hvp_data_fitting
+            total_grad = grad_data_fitting_term
 
-        tot_hvp = tot_hvp.to(self.device)
-        tot_gradient = tot_gradient.to(self.device)
-        end = time.time()
+        # Flatten total gradient
+        flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
 
-        second_derivative = -((tot_gradient / (1 + tot_gradient.T @ tot_gradient)) * (velocity.T @ tot_hvp)).flatten()
+        # Define total loss function
+        def total_loss_fn(p):
+            return self.CE_loss(p, data, self.f_MAP) + self.L2_norm(p)
+
+        # Compute Hessian-vector product
+        hvp_fn = lambda v: jax.jvp(grad(total_loss_fn), (params,), (v,))[1]
+        hvp_params = hvp_fn(velocity_params)
+        flat_hvp, _ = jax.flatten_util.ravel_pytree(hvp_params)
+
+        # Compute second derivative
+        denom = 1.0 + jnp.dot(flat_total_grad, flat_total_grad)
+        numerator = jnp.dot(velocity, flat_hvp)
+        second_derivative = - (flat_total_grad / denom) * numerator
 
         if return_hvp:
-            return second_derivative.view(-1, 1).detach().cpu().numpy(), tot_hvp.view(-1, 1).detach().cpu().numpy()
+            return second_derivative, flat_hvp
         else:
-            return second_derivative.view(-1, 1).detach().cpu().numpy()
+            return second_derivative
 
     def get_gradient_value_in_specific_point(self, current_point):
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
+        # Convert current_point to parameter structure
+        params = self.unravel_fn(current_point)
+
+        if self.batching:
+            grad_data_fitting_term = None
+            for batch_x, batch_y, batch_f_MAP in self.X:
+                data = (batch_x, batch_y)
+                grad_per_batch = self.compute_grad_data_fitting_term(params, data, batch_f_MAP)
+                if grad_data_fitting_term is None:
+                    grad_data_fitting_term = grad_per_batch
+                else:
+                    grad_data_fitting_term = jax.tree_util.tree_map(
+                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
+                    )
         else:
-            batchify = False
             data = (self.X, self.y)
+            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
 
-        # method to return the gradient of the loss in a specific point
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float()
-
-        current_point = current_point.to(self.device)
-        assert (
-            len(current_point) == self.n_params
-        ), "You are passing a larger vector than the number of weights in the model"
-        self.model.zero_grad()
-
-        self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-        grad_data_fitting_term = 0
-        if batchify:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            for batch_img, batch_label, batch_MAP in self.X:
-                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label), batch_MAP)
-                grad_data_fitting_term += stack_gradient3(grad_per_example, self.n_params).view(-1, 1)
+        grad_reg = self.compute_grad_L2_reg(params)
+        if grad_reg is not None:
+            total_grad = jax.tree_util.tree_map(
+                lambda x, y: x + y, grad_data_fitting_term, grad_reg
+            )
         else:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
+            total_grad = grad_data_fitting_term
 
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            grad_per_example = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
-            gradw = stack_gradient3(grad_per_example, self.n_params)
-            grad_data_fitting_term = gradw.view(-1, 1)
-        end = time.time()
-
-        # here now I have to compute also the gradient of the regularization term
-        if self.lambda_reg is not None:
-            # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
-
-        else:
-            grad_reg = 0
-
-        tot_gradient = grad_data_fitting_term + grad_reg
-        tot_gradient = tot_gradient.to(self.device)
-
-        return tot_gradient
+        flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
+        return flat_total_grad
