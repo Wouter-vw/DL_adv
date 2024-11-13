@@ -17,6 +17,15 @@ import time
 import copy
 import optax
 
+def custom_hvp(f, primals, tangents):
+    return jax.jvp(jax.grad(f), primals, tangents)[1]
+
+def make_zero_tangent(x):
+    if jnp.issubdtype(x.dtype, jnp.integer) or jnp.issubdtype(x.dtype, jnp.bool_):
+        return jax.ShapeDtypeStruct(x.shape, jax.dtypes.float0)
+    else:
+        return jnp.zeros_like(x)
+
 class regression_manifold:
     def __init__(self, model, X, y, batching=False, lambda_reg=None, noise_var=1):
         self.model = model
@@ -364,47 +373,82 @@ class cross_entropy_manifold:
         params = self.unravel_fn(current_point)
         velocity_params = self.unravel_fn(velocity)
 
-        # Compute gradient of data fitting term
+        n_params = len(current_point)
+    
+        # Initialize accumulated gradient as a zero vector of shape (n_params, 1)
+        grad_data_fitting_term = jnp.zeros((n_params, 1))
+        
         if self.batching:
-            grad_data_fitting_term = None
             for batch_x, batch_y in self.X:
                 data = (batch_x, batch_y)
+                # Compute gradient per batch
                 grad_per_batch = self.compute_grad_data_fitting_term(params, data)
-                if grad_data_fitting_term is None:
-                    grad_data_fitting_term = grad_per_batch
-                else:
-                    grad_data_fitting_term = jax.tree_util.tree_map(
-                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
-                    )
+                # Flatten the gradient per batch
+                flat_grad_per_batch, _ = jax.flatten_util.ravel_pytree(grad_per_batch)
+                # Reshape to (-1, 1)
+                flat_grad_per_batch = flat_grad_per_batch.reshape(-1, 1)
+                # Accumulate gradients
+                grad_data_fitting_term += flat_grad_per_batch
         else:
             data = (self.X, self.y)
-            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data)
+            grad_per_batch = self.compute_grad_data_fitting_term(params, data)
+            flat_grad_per_batch, _ = jax.flatten_util.ravel_pytree(grad_per_batch)
+            flat_grad_per_batch = flat_grad_per_batch.reshape(-1, 1)
+            grad_data_fitting_term = flat_grad_per_batch
 
         # Compute gradient of L2 regularization
         grad_reg = self.compute_grad_L2_reg(params)
         if grad_reg is not None:
-            total_grad = jax.tree_util.tree_map(
-                lambda x, y: x + y, grad_data_fitting_term, grad_reg
-            )
+            # Flatten and reshape grad_reg
+            flat_grad_reg, _ = jax.flatten_util.ravel_pytree(grad_reg)
+            flat_grad_reg = flat_grad_reg.reshape(-1, 1)
+            # Total gradient is the sum
+            total_grad = grad_data_fitting_term + flat_grad_reg
         else:
             total_grad = grad_data_fitting_term
-
-        # Flatten total gradient
-        flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
 
         # Define total loss function
         def total_loss_fn(p):
             return self.CE_loss(p, data) + self.L2_norm(p)
 
-        # Compute Hessian-vector product
-        hvp_fn = lambda v: jax.jvp(grad(total_loss_fn), (params,), (v,))[1]
-        hvp_params = hvp_fn(velocity_params)
-        flat_hvp, _ = jax.flatten_util.ravel_pytree(hvp_params)
+        # Compute HVP of CE_loss including data in primals and zero tangents for data
+        if self.batching:
+            # Initialize accumulated HVP
+            total_hvp = jnp.zeros(n_params)
+            for batch_x, batch_y in self.X:
+                data = (batch_x, batch_y)
+                def ce_loss_fn(p, d):
+                    return self.CE_loss(p, d)
+                # Create zero tangents for data
+                zero_data_tangent = jax.tree_util.tree_map(make_zero_tangent, data)
+                # Compute HVP per batch
+                hvp_ce_batch = custom_hvp(ce_loss_fn, (params, data), (velocity_params, zero_data_tangent))
+                # Flatten hvp_ce_batch
+                flat_hvp_ce_batch, _ = jax.flatten_util.ravel_pytree(hvp_ce_batch)
+                # Accumulate HVP
+                total_hvp += flat_hvp_ce_batch
+        else:
+            data = (self.X, self.y)
+            def ce_loss_fn(p, d):
+                return self.CE_loss(p, d)
+            zero_data_tangent = jax.tree_util.tree_map(make_zero_tangent, data)
+            hvp_ce_batch = custom_hvp(ce_loss_fn, (params, data), (velocity_params, zero_data_tangent))
+            flat_hvp_ce_batch, _ = jax.flatten_util.ravel_pytree(hvp_ce_batch)
+            total_hvp = flat_hvp_ce_batch
 
+        # Compute HVP of L2 regularization separately
+        if self.lambda_reg is not None:
+            # HVP of L2 regularization is 2 * lambda_reg * velocity
+            flat_velocity, _ = jax.flatten_util.ravel_pytree(velocity_params)
+            hvp_reg = 2 * self.lambda_reg * flat_velocity
+            # Total HVP is sum of HVPs
+            total_hvp += hvp_reg
+                
         # Compute second derivative
-        denom = 1.0 + jnp.dot(flat_total_grad, flat_total_grad)
-        numerator = jnp.dot(velocity.squeeze(), flat_hvp)
-        second_derivative = - (flat_total_grad / denom) * numerator
+        flat_velocity, _ = jax.flatten_util.ravel_pytree(velocity_params)
+        numerator = jnp.dot(flat_velocity, total_hvp)
+        denom = 1.0 + jnp.dot(total_grad.T, total_grad).item()  # total_grad is (n_params, 1)
+        second_derivative = - (total_grad.flatten() / denom) * numerator
 
         if return_hvp:
             return second_derivative, flat_hvp

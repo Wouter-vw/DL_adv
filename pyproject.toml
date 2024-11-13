@@ -13,6 +13,7 @@ dependencies = [
     "optax>=0.2.3",
     "pandas>=2.2.3",
     "scikit-learn>=1.5.2",
+    "scipy>=1.14.1",
     "seaborn>=0.13.2",
     "tensorflow>=2.18.0",
     "torch2jax>=0.0.1",

@@ -94,7 +94,7 @@ def main(args):
     plt.xticks([], [])
     plt.yticks([], [])
     plt.title("Train")
-    plt.show()
+    # plt.show()
 
     print("Some info about the dataset:")
     print(f"Train: {x_train.shape, y_train.shape}")
@@ -321,7 +321,7 @@ def main(args):
     plt.title("Confidence MAP")
     plt.xticks([], [])
     plt.yticks([], [])
-    plt.show()
+    # plt.show()
 
 
     ## Quick import of pytorch model for the laplace package!
