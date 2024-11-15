@@ -64,7 +64,7 @@ def main(args):
     # now I have to laod the banana dataset
     # filen = os.path.join("data", "banana", "banana.csv")
     # path is /Users/timotheusberg/Documents/COSSE/Year 2 - Stockholm/DL/Project/DL_adv/jax_version/data/banana/banana.csv
-    filen = "/Users/timotheusberg/Documents/COSSE/Year 2 - Stockholm/DL/Project/DL_adv/jax_version/data/banana/banana.csv"
+    filen = "/home/timo/Documents/COSSE/DL/DL_adv/jax_version/data/banana/banana.csv"
     Xy = np.loadtxt(filen, delimiter=",")
     Xy = jnp.asarray(Xy)
     x_train, y_train = Xy[:, :-1], Xy[:, -1]
@@ -128,7 +128,7 @@ def main(args):
         return batches
     
     # Create data loaders
-    batch_size_train = 1024
+    batch_size_train = 265
     batch_size_valid = 50
     batch_size_test = 50
     
@@ -163,16 +163,19 @@ def main(args):
             learning_rate = 1e-3
             weight_decay = 1e-3
             optimizer = optax.adamw(learning_rate, weight_decay=weight_decay)
-        return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
+
+        apply_fn = jax.jit(model.apply)
+
+        return train_state.TrainState.create(apply_fn=apply_fn, params=params, tx=optimizer)
 
         # Loss function
-    # @jax.jit
+    @jax.jit
     def compute_loss(logits, labels):
         labels = jnp.asarray(labels, dtype=jnp.int32)  # Ensure labels are int32
         return jnp.sum(optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=labels))
 
     # Training function
-    # @jax.jit
+    @jax.jit
     def train_step(state, batch_img, batch_label):
         def loss_fn(params):
             logits = state.apply_fn(params, batch_img)
@@ -195,7 +198,7 @@ def main(args):
         learning_rate = 1e-3
         weight_decay = 1e-2
         optimizer = optax.sgd(learning_rate)
-        max_epoch = 100
+        max_epoch = 2500
     else:
         learning_rate = 1e-3
         weight_decay = 1e-3
@@ -652,7 +655,8 @@ def main(args):
             else:
                 curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
             _new_weights = curve(1)[0]
-            weights_ours[n, :] = jnp.array(_new_weights.reshape(-1))
+            weights_ours = weights_ours.at[n, :].set(jnp.array(_new_weights.reshape(-1)))
+
 
     # I can get the LA weights
     weights_LA = jnp.zeros((n_posterior_samples, len(map_solution)))
@@ -1146,7 +1150,7 @@ if __name__ == "__main__":
     parser.add_argument("--structure", "-str", type=str, default="full", help="Hessian struct for Laplace")
     parser.add_argument("--subset", "-sub", type=str, default="all", help="subset of weights for Laplace")
     parser.add_argument("--samples", "-samp", type=int, default=50, help="number of posterior samples")
-    parser.add_argument("--linearized_pred", "-lin", type=bool, default=False, help="Linearization for prediction")
+    parser.add_argument("--linearized_pred", "-lin", type=bool, default=True, help="Linearization for prediction")
     parser.add_argument(
         "--expmap_different_batches",
         "-batches",

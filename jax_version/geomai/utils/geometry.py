@@ -74,16 +74,16 @@ def second2first_order(manifold, state, subset_of_weights):
 def evaluate_failed_solution(p0, p1, t):
     # Input: p0, p1 (D x 1), t (T x 0)
     c = (1 - t) * p0 + t * p1  # D x T
-    dc = jnp.repeat(p1 - p0, t.size, axis=1)  # D x T
+    dc = jnp.repeat(p1 - p0, jnp.size(t), axis=1)  # D x T
     return c, dc
 
 # If the ODE solver succeeded, provide the solution
 def evaluate_solution(solution, t, t_scale):
     # Input: t (Tx0), t_scale is used to scale the curve to have correct length
-    c_dc = solution(t * t_scale)
+    c_dc = solution.sol(t * t_scale)
     D = int(c_dc.shape[0] / 2)
 
-    if t.size == 1:
+    if jnp.size(t) == 1:
         c = c_dc[:D].reshape(D, 1)
         dc = c_dc[D:].reshape(D, 1) * t_scale
     else:
