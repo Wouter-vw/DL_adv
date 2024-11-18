@@ -62,9 +62,7 @@ def main(args):
 
     shuffle = True
     # now I have to laod the banana dataset
-    # filen = os.path.join("data", "banana", "banana.csv")
-    # path is /Users/timotheusberg/Documents/COSSE/Year 2 - Stockholm/DL/Project/DL_adv/jax_version/data/banana/banana.csv
-    filen = "/home/timo/Documents/COSSE/DL/DL_adv/jax_version/data/banana/banana.csv"
+    filen = os.path.join("data", "banana", "banana.csv")
     Xy = np.loadtxt(filen, delimiter=",")
     Xy = jnp.asarray(Xy)
     x_train, y_train = Xy[:, :-1], Xy[:, -1]
@@ -228,62 +226,12 @@ def main(args):
         if (epoch + 1) % 100 == 0:
             print(f"Epoch: {epoch + 1}, Train loss: {train_loss:.4f}, Val accuracy: {val_accuracy:.4f}")
     
-    def params_from_map(solution, state):
-        params = {'params': {}}
-        idx = 0
-
-        # Iterate over the layers to reconstruct the parameters dynamically
-        for layer_name, layer_params in state.params['params'].items():
-            # Get the shape of the kernel and bias
-            kernel_shape = layer_params['kernel'].shape
-            bias_shape = layer_params['bias'].shape
-            
-            # Calculate the number of elements in the kernel and bias
-            kernel_size = jnp.prod(jnp.array(kernel_shape))
-            bias_size = jnp.prod(jnp.array(bias_shape))
-
-
-            # Extract and reshape kernel from solution
-            kernel_flat = solution[idx:idx + kernel_size]
-            if kernel_flat.size == 0:
-                raise ValueError(f"Not enough elements in solution for layer {layer_name} kernel.")
-            kernel = kernel_flat.reshape(kernel_shape)
-            idx += kernel_size
-            
-            # Extract and reshape bias from map_solution
-            bias_flat = solution[idx:idx + bias_size]
-            if bias_flat.size == 0:
-                raise ValueError(f"Not enough elements in solution for layer {layer_name} bias.")
-            bias = bias_flat.reshape(bias_shape)
-            idx += bias_size
-            
-            # Assign the kernel and bias to the params dictionary
-            params['params'][layer_name] = {'kernel': kernel, 'bias': bias}
-        
-        # Replace the state with the new params
-        new_state = state.replace(params=params)
-
-        return new_state
-
     def get_map_solution(state):
-        """Function to flatten the kernels and biases, then concatenate them."""
-        params_flattened = []
-        
-        # Iterate over the layers dynamically
-        for layer_name, layer_params in state.params['params'].items():
-            kernel = layer_params['kernel']
-            bias = layer_params['bias']
-            
-            # Transpose the kernel and flatten both kernel and bias
-            params_flattened.extend([kernel.flatten(), bias.flatten()])
-        
-        # Concatenate the flattened kernel and bias arrays
-        map_solution = jnp.concatenate(params_flattened)
-        
-        return map_solution
+        map_solution, unravel_fn = jax.flatten_util.ravel_pytree(state.params)
+        return map_solution, unravel_fn
     
-    map_solution = get_map_solution(state)
-    state = params_from_map(map_solution, state)
+    map_solution, unravel_fn = get_map_solution(state)
+    state = state.replace(params = unravel_fn(map_solution))
 
     N_grid = 100
     offset = 2
@@ -422,7 +370,7 @@ def main(args):
             V_LA = samples
 
         else:
-            scale_tril = scale_tril = jnp.array(la.posterior_scale)
+            scale_tril = jnp.array(la.posterior_scale)
             V_LA = jax.random.multivariate_normal(rng, mean=jnp.zeros_like(map_solution), cov=scale_tril @ scale_tril.T, shape=(n_posterior_samples,))
             print(V_LA.shape)
 
@@ -466,7 +414,7 @@ def main(args):
     #  ok now I have the initial velocities. I can therefore consider my manifold
     if args.linearized_pred:
         # here I have to first compute the f_MAP in both cases
-        state = params_from_map(map_solution, state)
+        state = state.replace(params = unravel_fn(map_solution))
         f_MAP = state.apply_fn(state.params, x_train)
 
         if subset_of_weights == "last_layer":
@@ -478,8 +426,8 @@ def main(args):
             print(feature_extractor_map.shape)
             print(ll_map.shape)
 
-            f_state = params_from_map(feature_extractor_map, f_state)
-            l_state = params_from_map(ll_map, l_state)
+            f_state = state.replace(params = unravel_fn(feature_extractor_map))
+            l_state = state.replace(params = unravel_fn(ll_map))
             
             # I have to precompute some stuff
             # i.e. I am treating the hidden activation before the last layer as my input
@@ -570,8 +518,8 @@ def main(args):
             print(feature_extractor_map.shape)
             print(ll_map.shape)
 
-            f_state = params_from_map(feature_extractor_map, f_state)
-            l_state = params_from_map(ll_map, l_state)
+            f_state = state.replace(params = unravel_fn(feature_extractor_map))
+            l_state = state.replace(params = unravel_fn(ll_map))
             
             R = f_state.apply_fn(f_state.params, x_train)
 
@@ -617,7 +565,7 @@ def main(args):
             _new_ll_weights = curve(1)[0]
             _new_weights = jnp.concatenate((feature_extractor_map.reshape(-1), jnp.array(_new_ll_weights, dtype=jnp.float32).reshape(-1)), axis=0)
             weights_ours[n, :] = _new_weights.reshape(-1)
-            state = params_from_map(_new_weights, state)
+            state = state.replace(params = unravel_fn(_new_weights))
         
         else:
             # here I can try to sample a subset of datapoints, create a new manifold and solve expmap
@@ -673,8 +621,8 @@ def main(args):
         if subset_of_weights == "last_layer":
             # so I have to put the MAP back to the feature extraction part of the model
             
-            f_state = params_from_map(feature_extractor_map, f_state)
-            l_state = params_from_map(ll_map, l_state)
+            f_state = state.replace(params = unravel_fn(feature_extractor_map))
+            l_state = state.replace(params = unravel_fn(ll_map))
 
             # and then I have to create the new dataset
             R_MAP_grid = f_state.apply_fn(f_state.params, X_grid)
@@ -694,6 +642,7 @@ def main(args):
             P_grid_LAPLACE_lin = 0
             P_grid_OURS_lin = 0
 
+            ### Change this loop still (diff_as_params)
             # let's start with the X_grid
             for n in range(n_posterior_samples):
                 w_LA = weights_LA[n, :]
@@ -717,6 +666,7 @@ def main(args):
                 probs_grid = jax.nn.softmax(f_LA_grid, axis=1)
                 P_grid_LAPLACE_lin += probs_grid
 
+            ## Also need to change this loop still!
             # I should also do the same with our model (and use the tangent vector)
             # because if we use the final weights we get something wrong
             for n in range(n_posterior_samples):
@@ -726,7 +676,8 @@ def main(args):
                     ll_map
                 ), "We have a problem in the length of the last layer weights we are considering"
                 # put the weights into the model
-                l_state = params_from_map(ll_map, l_state)
+                l_state = state.replace(params = unravel_fn(ll_map))
+                
                 params = l_state.params['params']['output']['kernel'], l_state.params['params']['output']['bias']  
 
                 diff_weights = (w_ll_OUR - ll_map).astype(jnp.float32)
@@ -740,7 +691,7 @@ def main(args):
                 probs_grid = jax.nn.softmax(f_OUR_grid, axis=1)
                 P_grid_OUR_lin += probs_grid
         else:
-            state_model_2 = params_from_map(map_solution, state_model_2)
+            state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
             f_MAP_grid = state_model_2.apply_fn(state_model_2.params, X_grid)
             f_MAP_test = state_model_2.apply_fn(state_model_2.params, x_test)
 
@@ -766,7 +717,7 @@ def main(args):
             for n in range(n_posterior_samples):
                 w_LA = weights_LA[n, :]
                 # put the weights into the model
-                state_model_2 = params_from_map(map_solution, state_model_2)
+                state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
                 params = (
                     state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
                     state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
@@ -800,7 +751,7 @@ def main(args):
             for n in range(n_posterior_samples):
                 # get the theta weights we are interested in #
                 w_OUR = weights_ours[n, :]
-                state_model_2 = params_from_map(map_solution, state_model_2)
+                state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
                 params = (
                     state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
                     state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
@@ -918,7 +869,7 @@ def main(args):
         for n in range(n_posterior_samples):
             w_LA = weights_LA[n, :]
             # put the weights into the model
-            state_model_2 = params_from_map(map_solution, state_model_2)
+            state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
             params = (
                 state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
                 state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
@@ -952,7 +903,7 @@ def main(args):
         for n in range(n_posterior_samples):
             # get the theta weights we are interested in #
             w_OUR = weights_ours[n, :]
-            state_model_2 = params_from_map(map_solution, state_model_2)
+            state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
             params = (
                 state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
                 state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
@@ -1037,7 +988,7 @@ def main(args):
         P_grid_OUR = 0
         for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
-            state = params_from_map(weights_ours[n, :], state)
+            state = state.replace(params = unravel_fn(weights_ours[n, :]))
             # compute the predictions
             P_grid_our += jax.nn.softmax(state.apply_fn(state.params, X_grid), axis=1)
 
@@ -1084,20 +1035,20 @@ def main(args):
         P_test_LAPLACE = 0
         for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
-            state = params_from_map(weights_LA[n, :], state)
+            state = state.replace(params = unravel_fn(weights_LA[n, :]))
             # compute the predictions
             P_test_LAPLACE += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
 
         P_test_OURS = 0
         for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
-            state = params_from_map(weights_ours[n, :], state)
+            state = state.replace(params = unravel_fn(weights_ours[n, :]))
             # compute the predictions
             P_test_OURS += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
         
     # I can compute and plot the results
     # here I can also compute the MAP results
-    state = params_from_map(map_solution, state)
+    state = state.replace(params = unravel_fn(map_solution))
     P_test_MAP += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
 
     accuracy_MAP = accuracy(P_test_MAP, y_test)
@@ -1150,7 +1101,7 @@ if __name__ == "__main__":
     parser.add_argument("--structure", "-str", type=str, default="full", help="Hessian struct for Laplace")
     parser.add_argument("--subset", "-sub", type=str, default="all", help="subset of weights for Laplace")
     parser.add_argument("--samples", "-samp", type=int, default=50, help="number of posterior samples")
-    parser.add_argument("--linearized_pred", "-lin", type=bool, default=True, help="Linearization for prediction")
+    parser.add_argument("--linearized_pred", "-lin", type=bool, default=False, help="Linearization for prediction")
     parser.add_argument(
         "--expmap_different_batches",
         "-batches",
