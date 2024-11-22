@@ -956,7 +956,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_data", "-batch", type=bool, default=False, help="batch data")
 
     parser.add_argument("--structure", "-str", type=str, default="full", help="Hessian struct for Laplace")
-    parser.add_argument(x"--subset", "-sub", type=str, default="all", help="subset of weights for Laplace")
+    parser.add_argument("--subset", "-sub", type=str, default="all", help="subset of weights for Laplace")
     parser.add_argument("--samples", "-samp", type=int, default=50, help="number of posterior samples")
     parser.add_argument("--linearized_pred", "-lin", type=bool, default=False, help="Linearization for prediction")
     parser.add_argument(
