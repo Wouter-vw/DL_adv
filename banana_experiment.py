@@ -33,8 +33,7 @@ import geomai.utils.geometry as geometry
 from torch import nn as nn_torch
 ########################################
 #from manifold import linearized_cross_entropy_manifold
-#from manifoldwouter import linearized_cross_entropy_manifold
-from manifold_kfac import linearized_cross_entropy_manifold
+from manifoldwouter import linearized_cross_entropy_manifold
 #########################################
 from tqdm import tqdm
 import sklearn.datasets
