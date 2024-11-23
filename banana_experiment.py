@@ -26,9 +26,15 @@ import optax
 from laplace import Laplace
 import matplotlib.colors as colors
 import seaborn as sns
-import geomai.utils.geometry as geometry
+#####################################
+#import geomai.utils.geometry as geometry
+import geomai.utils.geometry_diffrax as geometry
+####################################################
 from torch import nn as nn_torch
-from manifold import cross_entropy_manifold, linearized_cross_entropy_manifold
+########################################
+#from manifold import linearized_cross_entropy_manifold
+from manifoldwouter import linearized_cross_entropy_manifold
+#########################################
 from tqdm import tqdm
 import sklearn.datasets
 from datautils import make_pinwheel_data
@@ -214,6 +220,7 @@ def main(args):
         return map_solution, unravel_fn
     
     map_solution, unravel_fn = get_map_solution(state)
+    test = unravel_fn(map_solution)
     state = state.replace(params = unravel_fn(map_solution))
 
     N_grid = 100
@@ -345,6 +352,7 @@ def main(args):
                     y=None,
                     f_MAP=f_MAP,
                     theta_MAP=map_solution,
+                    unravel_fn = unravel_fn,
                     batching=True,
                     lambda_reg=la.prior_precision.item() / 2,
                 )
@@ -356,6 +364,7 @@ def main(args):
                     y_train,
                     f_MAP=f_MAP,
                     theta_MAP=map_solution,
+                    unravel_fn = unravel_fn,
                     batching=False,
                     lambda_reg=la.prior_precision.item() / 2,
                 )
@@ -367,6 +376,7 @@ def main(args):
                     y=None,
                     f_MAP=f_MAP,
                     theta_MAP=map_solution,
+                    unravel_fn = unravel_fn,
                     batching=True,
                     lambda_reg=weight_decay,
                 )
@@ -378,6 +388,7 @@ def main(args):
                     y_train,
                     f_MAP=f_MAP,
                     theta_MAP=map_solution,
+                    unravel_fn = unravel_fn,
                     batching=False,
                     lambda_reg=weight_decay,
                 )
@@ -445,8 +456,7 @@ def main(args):
         else:
             curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
         _new_weights = curve(1)[0]
-        weights_ours[n, :] = jnp.array(_new_weights.reshape(-1))
-
+        weights_ours = weights_ours.at[n, :].set(jnp.array(_new_weights.reshape(-1)))
     # now I can use my weights for prediction. Deoending if I am using linearization or not the prediction looks differently
     if args.linearized_pred:
         state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
@@ -579,7 +589,7 @@ def main(args):
             f_OUR_test = f_MAP_test + jvp_value_test
 
             probs_test = jax.nn.softmax(f_OUR_test, axis=1)
-            P_grid_OUR_lin += probs_test
+            P_test_OURS += probs_test
 
     else:
         # and then our stuff
@@ -642,12 +652,15 @@ def main(args):
     accuracy_OURS = accuracy(P_test_OURS, y_test)
     nll_OUR = nll(P_test_OURS, y_test)
     brier_OURS = brier(P_test_OURS, y_test)
-    ece_our = calibration_error(P_test_OURS, y_test, norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
-    mce_our = calibration_error(P_test_OURS, y_test, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
+    #ece_our = calibration_error(P_test_OURS, y_test, norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
+    #mce_our = calibration_error(P_test_OURS, y_test, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
 
-    print(f"Results OURS: accuracy {accuracy_OURS}, nll {nll_OUR}, brier {brier_OURS}, ECE {ece_our}, MCE {mce_our}")
+    #print(f"Results OURS: accuracy {accuracy_OURS}, nll {nll_OUR}, brier {brier_OURS}, ECE {ece_our}, MCE {mce_our}")
     # now I can create my dictionary
-    dict_OUR = {"Accuracy": accuracy_OURS, "NLL": nll_OUR, "Brier": brier_OURS, "ECE": ece_our, "MCE": mce_our}
+    #dict_OUR = {"Accuracy": accuracy_OURS, "NLL": nll_OUR, "Brier": brier_OURS, "ECE": ece_our, "MCE": mce_our}
+    print(f"Results OURS: accuracy {accuracy_OURS}, nll {nll_OUR}, brier {brier_OURS}")
+    # now I can create my dictionary
+    dict_OUR = {"Accuracy": accuracy_OURS, "NLL": nll_OUR, "Brier": brier_OURS}
 
 
 if __name__ == "__main__":
