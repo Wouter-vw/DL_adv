@@ -44,7 +44,7 @@ def main(args):
     palette = sns.color_palette("colorblind")
     print("Linearization?")
     print(args.linearized_pred)
-    subset_of_weights = args.subset  #'last_layer' # either 'last_layer' or 'all'
+    subset_of_weights = args.subset  # must be 'all'
     hessian_structure = args.structure  #'full' # other possibility is 'diag' or 'full'
     n_posterior_samples = args.samples
     security_check = True
@@ -144,7 +144,10 @@ def main(args):
             learning_rate = 1e-3
             weight_decay = 1e-3
             optimizer = optax.adamw(learning_rate, weight_decay=weight_decay)
-        return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
+
+        apply_fn = jax.jit(model.apply)
+
+        return train_state.TrainState.create(apply_fn=apply_fn, params=params, tx=optimizer)
 
         # Loss function
     @jax.jit
@@ -206,62 +209,12 @@ def main(args):
         if (epoch + 1) % 100 == 0:
             print(f"Epoch: {epoch + 1}, Train loss: {train_loss:.4f}, Val accuracy: {val_accuracy:.4f}")
     
-    def params_from_map(solution, state):
-        params = {'params': {}}
-        idx = 0
-
-        # Iterate over the layers to reconstruct the parameters dynamically
-        for layer_name, layer_params in state.params['params'].items():
-            # Get the shape of the kernel and bias
-            kernel_shape = layer_params['kernel'].shape
-            bias_shape = layer_params['bias'].shape
-            
-            # Calculate the number of elements in the kernel and bias
-            kernel_size = jnp.prod(jnp.array(kernel_shape))
-            bias_size = jnp.prod(jnp.array(bias_shape))
-
-
-            # Extract and reshape kernel from solution
-            kernel_flat = solution[idx:idx + kernel_size]
-            if kernel_flat.size == 0:
-                raise ValueError(f"Not enough elements in solution for layer {layer_name} kernel.")
-            kernel = kernel_flat.reshape(kernel_shape)
-            idx += kernel_size
-            
-            # Extract and reshape bias from map_solution
-            bias_flat = solution[idx:idx + bias_size]
-            if bias_flat.size == 0:
-                raise ValueError(f"Not enough elements in solution for layer {layer_name} bias.")
-            bias = bias_flat.reshape(bias_shape)
-            idx += bias_size
-            
-            # Assign the kernel and bias to the params dictionary
-            params['params'][layer_name] = {'kernel': kernel, 'bias': bias}
-        
-        # Replace the state with the new params
-        new_state = state.replace(params=params)
-
-        return new_state
-
     def get_map_solution(state):
-        """Function to flatten the kernels and biases, then concatenate them."""
-        params_flattened = []
-        
-        # Iterate over the layers dynamically
-        for layer_name, layer_params in state.params['params'].items():
-            kernel = layer_params['kernel']
-            bias = layer_params['bias']
-            
-            # Transpose the kernel and flatten both kernel and bias
-            params_flattened.extend([kernel.flatten(), bias.flatten()])
-        
-        # Concatenate the flattened kernel and bias arrays
-        map_solution = jnp.concatenate(params_flattened)
-        
-        return map_solution
+        map_solution, unravel_fn = jax.flatten_util.ravel_pytree(state.params)
+        return map_solution, unravel_fn
     
-    map_solution = get_map_solution(state)
-    state = params_from_map(map_solution, state)
+    map_solution, unravel_fn = get_map_solution(state)
+    state = state.replace(params = unravel_fn(map_solution))
 
     N_grid = 100
     offset = 2
@@ -302,7 +255,7 @@ def main(args):
     plt.title("Confidence MAP")
     plt.xticks([], [])
     plt.yticks([], [])
-    plt.show()
+    # plt.show()
 
 
     ## Quick import of pytorch model for the laplace package!
@@ -368,7 +321,7 @@ def main(args):
     #  ok now I have the initial velocities. I can therefore consider my manifold
     if args.linearized_pred:
         # here I have to first compute the f_MAP in both cases
-        state = params_from_map(map_solution, state)
+        state = state.replace(params = unravel_fn(map_solution))
         f_MAP = state.apply_fn(state.params, x_train)
 
         state_model_2 = create_train_state(rng, model, optimizer=args.optimizer)
@@ -496,7 +449,7 @@ def main(args):
 
     # now I can use my weights for prediction. Deoending if I am using linearization or not the prediction looks differently
     if args.linearized_pred:
-        state_model_2 = params_from_map(map_solution, state_model_2)
+        state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
         f_MAP_grid = state_model_2.apply_fn(state_model_2.params, X_grid)
         f_MAP_test = state_model_2.apply_fn(state_model_2.params, x_test)
 
@@ -521,7 +474,7 @@ def main(args):
         for n in range(n_posterior_samples):
             # get the theta weights we are interested in #
             w_OUR = weights_ours[n, :]
-            state_model_2 = params_from_map(map_solution, state_model_2)
+            state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
             params = (
                 state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
                 state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
@@ -534,12 +487,12 @@ def main(args):
             diff_weights = (w_OUR - map_solution).astype(jnp.float32)
 
             diff_as_params = (
-                params_from_map(diff_weights, state_model_2 ).params['params']['Dense_0']['kernel'],  # Dense_0 kernel
-                params_from_map(diff_weights, state_model_2).params['params']['Dense_0']['bias'],    # Dense_0 bias
-                params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['kernel'],  # Dense_1 kernel
-                params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['bias'],    # Dense_1 bias
-                params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['kernel'],  # Dense_2 kernel
-                params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['bias'],    # Dense_2 bias
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_0']['kernel'],  
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_0']['bias'],
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_1']['kernel'],  
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_1']['bias'],  
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_2']['kernel'],  
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_2']['bias'],   
             )
 
             _, jvp_value_grid = jax.jvp(
@@ -596,7 +549,8 @@ def main(args):
         for n in range(n_posterior_samples):
             # get the theta weights we are interested in #
             w_OUR = weights_ours[n, :]
-            state_model_2 = params_from_map(map_solution, state_model_2)
+            state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
+
             params = (
                 state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
                 state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
@@ -609,12 +563,12 @@ def main(args):
             diff_weights = (w_OUR - map_solution).astype(jnp.float32)
 
             diff_as_params = (
-                params_from_map(diff_weights, state_model_2 ).params['params']['Dense_0']['kernel'],  # Dense_0 kernel
-                params_from_map(diff_weights, state_model_2).params['params']['Dense_0']['bias'],    # Dense_0 bias
-                params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['kernel'],  # Dense_1 kernel
-                params_from_map(diff_weights, state_model_2).params['params']['Dense_1']['bias'],    # Dense_1 bias
-                params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['kernel'],  # Dense_2 kernel
-                params_from_map(diff_weights, state_model_2).params['params']['Dense_2']['bias'],    # Dense_2 bias
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_0']['kernel'],  
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_0']['bias'],
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_1']['kernel'],  
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_1']['bias'],  
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_2']['kernel'],  
+                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_2']['bias'],   
             )
 
             _, jvp_value_test = jax.jvp(
@@ -632,7 +586,7 @@ def main(args):
         P_grid_OUR = 0
         for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
-            state = params_from_map(weights_ours[n, :], state)
+            state = state.replace(params = unravel_fn(weights_ours[n, :]))
             # compute the predictions
             P_grid_OUR += jax.nn.softmax(state.apply_fn(state.params, X_grid), axis=1)
 
@@ -677,7 +631,7 @@ def main(args):
         P_test_OURS = 0
         for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
-            state = params_from_map(weights_ours[n, :], state)
+            state = state.replace(params = unravel_fn(weights_ours[n, :]))
             # compute the predictions
             P_test_OURS += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
         

@@ -74,16 +74,16 @@ def second2first_order(manifold, state, subset_of_weights):
 def evaluate_failed_solution(p0, p1, t):
     # Input: p0, p1 (D x 1), t (T x 0)
     c = (1 - t) * p0 + t * p1  # D x T
-    dc = jnp.repeat(p1 - p0, t.size, axis=1)  # D x T
+    dc = jnp.repeat(p1 - p0, jnp.size(t), axis=1)  # D x T
     return c, dc
 
 # If the ODE solver succeeded, provide the solution
 def evaluate_solution(solution, t, t_scale):
     # Input: t (Tx0), t_scale is used to scale the curve to have correct length
-    c_dc = solution(t * t_scale)
+    c_dc = solution.sol(t * t_scale)
     D = int(c_dc.shape[0] / 2)
 
-    if t.size == 1:
+    if jnp.size(t) == 1:
         c = c_dc[:D].reshape(D, 1)
         dc = c_dc[D:].reshape(D, 1) * t_scale
     else:
@@ -144,7 +144,8 @@ def expmap(manifold, x, v, subset_of_weights='all'):
     D = x.shape[0]
 
     # The solver needs the function in a specific format
-    def ode_fun(c_dc, t):
+    def ode_fun(t, c_dc):
+        # print("ODE fun called")
         return second2first_order(manifold, c_dc, subset_of_weights).flatten()
 
     if jnp.linalg.norm(v) > 1e-5:
@@ -159,58 +160,76 @@ def expmap(manifold, x, v, subset_of_weights='all'):
     return curve, failed
 
 # This function solves the initial value problem for the implementation of the expmap
+# def new_solve_expmap(manifold, x, v, ode_fun, subset_of_weights):
+#     D = x.shape[0]
+
+#     # Ensure inputs are JAX arrays
+#     x = jnp.array(x)
+#     v = jnp.array(v)
+
+#     init = jnp.concatenate((x, v), axis=0).flatten()  # Initial state
+
+#     failed = False
+
+#     # Time points where to solve the ODE
+#     t = jnp.linspace(0, 1, 100)
+
+#     # Define the ODE term
+#     term = diffrax.ODETerm(ode_fun)
+
+#     # Choose the solver (adaptive step size)
+#     solver = diffrax.Dopri5()
+
+#     # Initial condition
+#     y0 = init
+
+#     # Time span
+#     t0 = t[0]
+#     t1 = t[-1]
+
+#     # Compute initial step size (dt0)
+#     dt0 = float(t[1] - t[0])  # Assuming t has more than one element
+
+#     # Save at specified time points
+#     saveat = diffrax.SaveAt(ts=t)
+
+#     # Set up the step size controller for adaptive stepping
+#     stepsize_controller = diffrax.PIDController(rtol=1e-5, atol=1e-8)
+
+#     # Solve the ODE
+#     sol = diffrax.diffeqsolve(
+#         term,
+#         solver,
+#         t0=t0,
+#         t1=t1,
+#         dt0=dt0,
+#         y0=y0,
+#         saveat=saveat
+#         )
+
+#     # Interpolation function
+#     solution = sol.interpolate
+
+#     # Define the curve function
+#     curve = lambda tt: evaluate_solution(solution, tt, 1)
+
+#     return curve, failed
+
+# Old solver
+import numpy as np
+from scipy.integrate import solve_ivp
+
 def new_solve_expmap(manifold, x, v, ode_fun, subset_of_weights):
     D = x.shape[0]
-
-    # Ensure inputs are JAX arrays
-    x = jnp.array(x)
-    v = jnp.array(v)
-
-    init = jnp.concatenate((x, v), axis=0).flatten()  # Initial state
+        
+    init = np.concatenate((x, v), axis=0).flatten()  # 2D x 1 -> (2D, ), the solver needs this shape
 
     failed = False
 
-    # Time points where to solve the ODE
-    t = jnp.linspace(0, 1, 100)
+    prev_t = 0
+    t = 1
 
-    # Define the ODE term
-    term = diffrax.ODETerm(ode_fun)
-
-    # Choose the solver (adaptive step size)
-    solver = diffrax.Dopri5()
-
-    # Initial condition
-    y0 = init
-
-    # Time span
-    t0 = t[0]
-    t1 = t[-1]
-
-    # Compute initial step size (dt0)
-    dt0 = float(t[1] - t[0])  # Assuming t has more than one element
-
-    # Save at specified time points
-    saveat = diffrax.SaveAt(ts=t)
-
-    # Set up the step size controller for adaptive stepping
-    stepsize_controller = diffrax.PIDController(rtol=1e-5, atol=1e-8)
-
-    # Solve the ODE
-    sol = diffrax.diffeqsolve(
-        term,
-        solver,
-        t0=t0,
-        t1=t1,
-        dt0=dt0,
-        y0=y0,
-        saveat=saveat,
-        stepsize_controller=stepsize_controller
-    )
-
-    # Interpolation function
-    solution = sol.interpolate
-
-    # Define the curve function
-    curve = lambda tt: evaluate_solution(solution, tt, 1)
-
+    solution = solve_ivp(ode_fun, [prev_t, t], init, dense_output=True, atol = 1e-3, rtol= 1e-6)  # First solution of the IVP problem
+    curve = lambda tt: evaluate_solution(solution, tt, 1)  # with length(c(t)) != ||v||_c
+    
     return curve, failed

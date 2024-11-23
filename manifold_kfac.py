@@ -302,51 +302,6 @@ class cross_entropy_manifold:
         else:
             return second_derivative.view(-1, 1).detach().cpu().numpy()
 
-    def get_gradient_value_in_specific_point(self, current_point):
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
-        else:
-            batchify = False
-            data = (self.X, self.y)
-
-        # method to return the gradient of the loss in a specific point
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float()
-
-        current_point = current_point.to(self.device)
-        assert (
-            len(current_point) == self.n_params
-        ), "You are passing a larger vector than the number of weights in the model"
-        self.model.zero_grad()
-
-        self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-        grad_data_fitting_term = 0
-        if self.batching:
-            for batch_img, batch_label in self.X:
-                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label))
-                grad_data_fitting_term += stack_gradient3(grad_per_example, self.n_params).view(-1, 1)
-        else:
-            data = (self.X, self.y)
-            grad_per_example = self.compute_grad_data_fitting_term(params, data)
-
-            gradw = stack_gradient3(grad_per_example, self.n_params)
-            grad_data_fitting_term = gradw.view(-1, 1)
-
-        # now I have to compute the regularization term
-        if self.lambda_reg is not None:
-            # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
-        else:
-            grad_reg = 0
-
-        tot_gradient = grad_data_fitting_term + grad_reg
-        tot_gradient = tot_gradient.to(self.device)
-
-        return tot_gradient
-
 ### Check what parameters to pass to the new hvp!!
 class linearized_cross_entropy_manifold:
     """
@@ -425,7 +380,6 @@ class linearized_cross_entropy_manifold:
         return activations
 
     # Function to compute gradients (weights only)
-    ## Adjust to more closely reflect CE LOSS (is it necessary)
     def compute_gradients(self, model, input, target, criterion):
         model.zero_grad()
         output = model(input)
@@ -535,19 +489,12 @@ class linearized_cross_entropy_manifold:
         return self.lambda_reg * w_norm
 
     def compute_grad_data_fitting_term(self, params, data, f_MAP):
-        # TODO: understand how to make vmap work without passing the data
         ft_compute_grad = grad(self.CE_loss)
-        # ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0, 0))
-        # the input of this function is just the parameters, because
-        # we are accessing the data from the class
         ft_per_sample_grads = ft_compute_grad(params, data, f_MAP)
         return ft_per_sample_grads
 
     def compute_grad_L2_reg(self, params):
         ft_compute_grad = grad(self.L2_norm)
-        # ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0))
-        # the input of this function is just the parameters, because
-        # we are accessing the data from the class
         ft_per_sample_grads = ft_compute_grad(params)
         return ft_per_sample_grads
 
@@ -663,62 +610,3 @@ class linearized_cross_entropy_manifold:
             return second_derivative.view(-1, 1).detach().cpu().numpy(), tot_hvp.view(-1, 1).detach().cpu().numpy()
         else:
             return second_derivative.view(-1, 1).detach().cpu().numpy()
-
-    def get_gradient_value_in_specific_point(self, current_point):
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
-        else:
-            batchify = False
-            data = (self.X, self.y)
-
-        # method to return the gradient of the loss in a specific point
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float()
-
-        current_point = current_point.to(self.device)
-        assert (
-            len(current_point) == self.n_params
-        ), "You are passing a larger vector than the number of weights in the model"
-        self.model.zero_grad()
-
-        self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-        grad_data_fitting_term = 0
-        if batchify:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            for batch_img, batch_label, batch_MAP in self.X:
-                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label), batch_MAP)
-                grad_data_fitting_term += stack_gradient3(grad_per_example, self.n_params).view(-1, 1)
-        else:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            grad_per_example = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
-            gradw = stack_gradient3(grad_per_example, self.n_params)
-            grad_data_fitting_term = gradw.view(-1, 1)
-        end = time.time()
-
-        # here now I have to compute also the gradient of the regularization term
-        if self.lambda_reg is not None:
-            # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
-
-        else:
-            grad_reg = 0
-
-        tot_gradient = grad_data_fitting_term + grad_reg
-        tot_gradient = tot_gradient.to(self.device)
-
-        return tot_gradient
