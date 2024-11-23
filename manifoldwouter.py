@@ -33,6 +33,10 @@ class linearized_cross_entropy_manifold:
         unravel_fn,
         batching=False,
         lambda_reg=None,
+        N=None,
+        B1=None,
+        B2=None,
+    
     ):
         self.state = state_model
         self.X = X
@@ -51,6 +55,16 @@ class linearized_cross_entropy_manifold:
         self.n_params, _ = self.get_num_params(self.params)
         self.unravel_fn = unravel_fn
         self.test = self.unravel_fn(theta_MAP)
+
+        self.N = N
+        self.B1 = B1
+        self.B2 = B2
+        self.factor = None
+
+        if self.B1 is not None:
+            self.factor = N / B1
+            if self.B2 is not None:
+                self.factor = self.factor * (B2 / B1)
 
     def get_num_params(self, params):
         flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
@@ -137,19 +151,14 @@ class linearized_cross_entropy_manifold:
         grad_data_fitting_term = 0
         if batchify:
             params = self.unravel_fn(current_point)
-            state_fmodel = state.replace(params = params)
             self.params_map = self.unravel_fn(self.theta_MAP)
-            state_fmodel_map = state.replace(params = self.params_map)
 
             for batch_img, batch_label, batch_MAP in self.X:
                 grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label), batch_MAP)
                 grad_data_fitting_term += grad_per_example.reshape(-1, 1)
         else:
             params = self.unravel_fn(current_point)
-            state_fmodel = state.replace(params = params)
-
             self.params_map = self.unravel_fn(self.theta_MAP)
-            state_fmodel_map = state.replace(params = self.params_map)
 
             grad_per_example = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
             grad_data_fitting_term = grad_per_example.reshape(-1, 1)

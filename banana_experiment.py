@@ -27,13 +27,14 @@ from laplace import Laplace
 import matplotlib.colors as colors
 import seaborn as sns
 #####################################
-#import geomai.utils.geometry as geometry
-import geomai.utils.geometry_diffrax as geometry
+import geomai.utils.geometry as geometry
+#import geomai.utils.geometry_diffrax as geometry
 ####################################################
 from torch import nn as nn_torch
 ########################################
 #from manifold import linearized_cross_entropy_manifold
-from manifoldwouter import linearized_cross_entropy_manifold
+#from manifoldwouter import linearized_cross_entropy_manifold
+from manifold_kfac import linearized_cross_entropy_manifold
 #########################################
 from tqdm import tqdm
 import sklearn.datasets
@@ -436,6 +437,7 @@ def main(args):
                     sub_y_train,
                     f_MAP=sub_f_MAP,
                     theta_MAP=map_solution,
+                    unravel_fn=unravel_fn,
                     batching=False,
                     lambda_reg=la.prior_precision.item() / 2,
                     N=len(x_train),
@@ -463,18 +465,9 @@ def main(args):
         f_MAP_grid = state_model_2.apply_fn(state_model_2.params, X_grid)
         f_MAP_test = state_model_2.apply_fn(state_model_2.params, x_test)
 
-        def predict(params, data):
-            param_names = ['Dense_0', 'Dense_1', 'Dense_2']
-            params_dict = {
-                'params': {
-                    param_names[i]: {
-                        'kernel': params[i * 2], 
-                        'bias': params[i * 2 + 1]
-                    }
-                    for i in range(len(param_names))
-                }
-            }
-            return state_model_2.apply_fn(params_dict, data)
+        def predict(params, datas):
+            y_pred = state_model_2.apply_fn(params, datas)
+            return y_pred
 
         P_grid_OURS_lin = 0
         P_test_OURS = 0
@@ -484,26 +477,11 @@ def main(args):
         for n in range(n_posterior_samples):
             # get the theta weights we are interested in #
             w_OUR = weights_ours[n, :]
-            state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
-            params = (
-                state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
-                state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
-                state_model_2.params['params']['Dense_1']['kernel'],  # Dense_1 kernel
-                state_model_2.params['params']['Dense_1']['bias'],    # Dense_1 bias
-                state_model_2.params['params']['Dense_2']['kernel'],  # Dense_2 kernel
-                state_model_2.params['params']['Dense_2']['bias'],    # Dense_2 bias
-            )
+            params = unravel_fn(map_solution)
 
             diff_weights = (w_OUR - map_solution).astype(jnp.float32)
 
-            diff_as_params = (
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_0']['kernel'],  
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_0']['bias'],
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_1']['kernel'],  
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_1']['bias'],  
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_2']['kernel'],  
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_2']['bias'],   
-            )
+            diff_as_params = unravel_fn(diff_weights)
 
             _, jvp_value_grid = jax.jvp(
                 predict,
@@ -559,27 +537,11 @@ def main(args):
         for n in range(n_posterior_samples):
             # get the theta weights we are interested in #
             w_OUR = weights_ours[n, :]
-            state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
-
-            params = (
-                state_model_2.params['params']['Dense_0']['kernel'],  # Dense_0 kernel
-                state_model_2.params['params']['Dense_0']['bias'],    # Dense_0 bias
-                state_model_2.params['params']['Dense_1']['kernel'],  # Dense_1 kernel
-                state_model_2.params['params']['Dense_1']['bias'],    # Dense_1 bias
-                state_model_2.params['params']['Dense_2']['kernel'],  # Dense_2 kernel
-                state_model_2.params['params']['Dense_2']['bias'],    # Dense_2 bias
-            )
+            params = unravel_fn(map_solution)
 
             diff_weights = (w_OUR - map_solution).astype(jnp.float32)
 
-            diff_as_params = (
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_0']['kernel'],  
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_0']['bias'],
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_1']['kernel'],  
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_1']['bias'],  
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_2']['kernel'],  
-                state_model_2.replace(params = unravel_fn(diff_weights)).params['params']['Dense_2']['bias'],   
-            )
+            diff_as_params = unravel_fn(diff_weights)
 
             _, jvp_value_test = jax.jvp(
                 predict,
