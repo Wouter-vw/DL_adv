@@ -33,7 +33,7 @@ import geomai.utils.geometry as geometry
 from torch import nn as nn_torch
 ########################################
 #from manifold import linearized_cross_entropy_manifold
-from manifoldwouter import linearized_cross_entropy_manifold
+from manifoldwouter import linearized_cross_entropy_manifold, cross_entropy_manifold
 #########################################
 from tqdm import tqdm
 import sklearn.datasets
@@ -43,6 +43,8 @@ from sklearn.metrics import brier_score_loss
 import argparse
 from torchmetrics.functional.classification import calibration_error
 import os
+
+from torchmetrics.functional.classification import calibration_error
 
 jax.config.update('jax_enable_x64', True)
 
@@ -185,7 +187,7 @@ def main(args):
         learning_rate = 1e-3
         weight_decay = 1e-2
         optimizer = optax.sgd(learning_rate)
-        max_epoch = 2500
+        max_epoch = 1500
     else:
         learning_rate = 1e-3
         weight_decay = 1e-3
@@ -262,7 +264,7 @@ def main(args):
     plt.title("Confidence MAP")
     plt.xticks([], [])
     plt.yticks([], [])
-    # plt.show()
+    plt.show()
 
 
     ## Quick import of pytorch model for the laplace package!
@@ -400,22 +402,22 @@ def main(args):
         if optimize_prior:
             if batch_data:
                 manifold = cross_entropy_manifold(
-                    state_model_2, train_loader, y=None, batching=True, lambda_reg=la.prior_precision.item() / 2
+                    state_model_2, train_loader, y=None, unravel_fn=unravel_fn, batching=True, lambda_reg=la.prior_precision.item() / 2
                 )
 
             else:
                 manifold = cross_entropy_manifold(
-                    state_model_2, x_train, y_train, batching=False, lambda_reg=la.prior_precision.item() / 2
+                    state_model_2, x_train, y_train, unravel_fn=unravel_fn, batching=False, lambda_reg=la.prior_precision.item() / 2
                 )
         else:
             if batch_data:
                 manifold = cross_entropy_manifold(
-                    state_model_2, train_loader, y=None, batching=True, lambda_reg=weight_decay
+                    state_model_2, train_loader, y=None, unravel_fn=unravel_fn, batching=True, lambda_reg=weight_decay
                 )
 
             else:
                 manifold = cross_entropy_manifold(
-                    state_model_2, x_train, y_train, batching=False, lambda_reg=weight_decay
+                    state_model_2, x_train, y_train, unravel_fn=unravel_fn, batching=False, lambda_reg=weight_decay
                 )
     # now i have my manifold and so I can solve the expmap
     weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
@@ -613,15 +615,18 @@ def main(args):
     accuracy_OURS = accuracy(P_test_OURS, y_test)
     nll_OUR = nll(P_test_OURS, y_test)
     brier_OURS = brier(P_test_OURS, y_test)
+    
+    ece_our = calibration_error(torch.from_numpy(np.array(P_test_OURS)), torch.from_numpy(np.array(y_test)), norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
+    mce_our = calibration_error(torch.from_numpy(np.array(P_test_OURS)), torch.from_numpy(np.array(y_test)), norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
     #ece_our = calibration_error(P_test_OURS, y_test, norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
     #mce_our = calibration_error(P_test_OURS, y_test, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
 
-    #print(f"Results OURS: accuracy {accuracy_OURS}, nll {nll_OUR}, brier {brier_OURS}, ECE {ece_our}, MCE {mce_our}")
+    print(f"Results OURS: accuracy {accuracy_OURS}, nll {nll_OUR}, brier {brier_OURS}, ECE {ece_our}, MCE {mce_our}")
     # now I can create my dictionary
     #dict_OUR = {"Accuracy": accuracy_OURS, "NLL": nll_OUR, "Brier": brier_OURS, "ECE": ece_our, "MCE": mce_our}
-    print(f"Results OURS: accuracy {accuracy_OURS}, nll {nll_OUR}, brier {brier_OURS}")
+    #print(f"Results OURS: accuracy {accuracy_OURS}, nll {nll_OUR}, brier {brier_OURS}")
     # now I can create my dictionary
-    dict_OUR = {"Accuracy": accuracy_OURS, "NLL": nll_OUR, "Brier": brier_OURS}
+    #dict_OUR = {"Accuracy": accuracy_OURS, "NLL": nll_OUR, "Brier": brier_OURS}
 
 
 if __name__ == "__main__":

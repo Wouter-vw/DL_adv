@@ -17,6 +17,7 @@ from jax.scipy.special import logsumexp
 import tensorflow as tf
 import time
 
+
 class linearized_cross_entropy_manifold:
     """
     Also in this case I have to separate data fitting term and regularization term for gradient and
@@ -42,7 +43,6 @@ class linearized_cross_entropy_manifold:
         self.X = X
         self.y = y
         self.N = len(self.X)
-        self.n_params = len(theta_MAP)
         self.batching = batching
         self.type = type
         self.lambda_reg = lambda_reg
@@ -52,25 +52,17 @@ class linearized_cross_entropy_manifold:
         self.f_MAP = f_MAP
         # Initialize model parameters
         self.params = theta_MAP
-        self.n_params, _ = self.get_num_params(self.params)
         self.unravel_fn = unravel_fn
-        self.test = self.unravel_fn(theta_MAP)
 
         self.N = N
         self.B1 = B1
         self.B2 = B2
-        self.factor = None
+        self.factor = 1.0
 
         if self.B1 is not None:
             self.factor = N / B1
             if self.B2 is not None:
                 self.factor = self.factor * (B2 / B1)
-
-    def get_num_params(self, params):
-        flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
-        n_params = flat_params.shape[0]
-        return n_params, unravel_fn
-
     @staticmethod
     def is_diagonal():
         return False
@@ -102,8 +94,9 @@ class linearized_cross_entropy_manifold:
             
             # Use targets as indices (not one-hot encoded)
             return jnp.sum(-jnp.take_along_axis(log_probs, targets[:, None], axis=-1))  # Use targets as indices
+        
+        return self.factor * criterion(y_pred, y)
 
-        return criterion(y_pred, y)
 
     def L2_norm(self, param):
         """
@@ -129,10 +122,8 @@ class linearized_cross_entropy_manifold:
     @partial(jax.jit, static_argnums=(0, 1))
     def custom_hvp(self, f, primals, tangents):
         grad_f = grad(f)
-        # Compute the gradient of f with respect to primals
-        grad_val = grad_f(*primals)
-        # Compute the Jacobian-vector product (JVP) using grad_val and tangents
         return jax.jvp(grad_f, primals, tangents)
+    
     @partial(jax.jit, static_argnums=(0,))
     def geodesic_system(self, current_point, velocity, return_hvp=False):
 
@@ -217,3 +208,176 @@ class linearized_cross_entropy_manifold:
             return second_derivative.reshape(-1, 1), tot_hvp.reshape(-1, 1)
         else:
             return second_derivative.reshape(-1, 1)
+        
+
+
+class cross_entropy_manifold:
+    """
+    Also in this case I have to split the gradient loss computation and the gradient of the regularization
+    term.
+    This is needed to get the correct gradient and hessian computation when using batches.
+    """
+
+    def __init__(
+        self, 
+        state_model, 
+        X, 
+        y,
+        unravel_fn, 
+        batching=False, 
+        lambda_reg=None, 
+        N=None, 
+        B1=None, 
+        B2=None
+    ):
+        self.state = state_model
+        self.X = X
+        self.y = y
+        self.N = len(self.X)
+        self.batching = batching
+        self.type = type
+        self.lambda_reg = lambda_reg
+        assert y is None if batching else True, "If batching is True, y should be None"
+
+        self.unravel_fn = unravel_fn
+
+
+        ## stuff we need when using batches
+        self.N = N
+        self.B1 = B1
+        self.B2 = B2
+        self.factor = 1.0
+
+        # here I can already compute the factor_loss
+        if self.B1 is not None:
+            self.factor = N / B1
+            if self.B2 is not None:
+                self.factor = self.factor * (B2 / B1)
+
+    @staticmethod
+    def is_diagonal():
+        return False
+
+    @partial(jax.jit, static_argnums=(0))
+    def CE_loss(self, param, data):
+        """
+        Data fitting term of the loss
+        """
+        x, y = data
+        y_pred = self.state.apply_fn(param, x)
+
+        def criterion(predictions, targets):
+            # Apply softmax to predictions to get probabilities
+            probs = jax.nn.softmax(predictions, axis=-1)
+            
+            # Use log of probabilities to get log-probabilities
+            log_probs = jnp.log(probs)
+            
+            # Use targets as indices (not one-hot encoded)
+            return jnp.sum(-jnp.take_along_axis(log_probs, targets[:, None], axis=-1))  # Use targets as indices
+
+        return self.factor * criterion(y_pred, y)
+
+
+
+    def L2_norm(self, param):
+        """
+        L2 regularization. I need this separate from the loss for the gradient computation.
+        """
+        # Sum squared values of the parameters
+        w_norm = sum(jnp.sum(w ** 2) for w in jax.tree_util.tree_leaves(param['params']))
+        return self.lambda_reg * w_norm
+
+    @partial(jax.jit, static_argnums=(0))
+    def compute_grad_data_fitting_term(self, params, data):
+        ft_compute_grad = grad(self.CE_loss)
+
+        ft_per_sample_grads = ft_compute_grad(params, data)
+        return jax.flatten_util.ravel_pytree(ft_per_sample_grads)[0]
+
+    @partial(jax.jit, static_argnums=(0))
+    def compute_grad_L2_reg(self, params):
+        ft_compute_grad = grad(self.L2_norm)
+        ft_per_sample_grads = ft_compute_grad(params)
+        return jax.flatten_util.ravel_pytree(ft_per_sample_grads)[0]
+    
+    @partial(jax.jit, static_argnums=(0, 1))
+    def custom_hvp(self, f, primals, tangents):
+        grad_f = grad(f)
+        return jax.jvp(grad_f, primals, tangents)
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def geodesic_system(self, current_point, velocity, return_hvp=False):
+        if isinstance(self.X, tf.data.Dataset):
+            batchify = True
+        else:
+            batchify = False
+            data = (self.X, self.y)
+
+        # let's start by putting the current points into the model
+        state = self.state.replace(params = self.unravel_fn(current_point))
+
+        # now I have everything to compute the the second derivative
+        # let's compute the gradient
+        start = time.time()
+        grad_data_fitting_term = 0
+        if batchify:
+            params = self.unravel_fn(current_point)
+            for batch_img, batch_label in self.X:
+                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label))
+                grad_data_fitting_term += grad_per_example.reshape(-1, 1)
+        else:
+            params = self.unravel_fn(current_point)
+            grad_per_example = self.compute_grad_data_fitting_term(params, data)
+            grad_data_fitting_term = grad_per_example.reshape(-1, 1)
+        end = time.time()
+
+        # here now I have to compute also the gradient of the regularization term
+        if self.lambda_reg is not None:
+            # I have to compute the L2 reg gradient
+            grad_reg = self.compute_grad_L2_reg(params)
+            grad_reg = grad_reg.reshape(-1, 1)
+
+        else:
+            grad_reg = 0
+
+        tot_gradient = grad_data_fitting_term + grad_reg
+
+        # and I have to reshape the velocity into being the same structure as the params
+        vel_as_params = self.unravel_fn(velocity)
+
+        # now I have also to compute the Hvp between hessian and velocity
+        start = time.time()
+        hvp_data_fitting = 0
+        if batchify:
+            for batch_img, batch_label in self.X:
+                _, result = self.custom_hvp(
+                    self.CE_loss,
+                    (params, (batch_img, batch_label)),
+                    (vel_as_params, (jnp.zeros_like(batch_img), jnp.zeros_like(batch_label))),
+                )
+            
+            hvp_data_fitting += jax.flatten_util.ravel_pytree(result)[0]
+
+        else:
+            _, result = self.custom_hvp(
+                self.CE_loss, (params, data), (vel_as_params, (jnp.zeros_like(data[0]), jnp.zeros(data[1].shape, dtype=jax.dtypes.float0)))
+            )
+        
+            hvp_data_fitting += jax.flatten_util.ravel_pytree(result)[0]
+
+
+        if self.lambda_reg is not None:
+            hvp_reg = 2 * self.lambda_reg * velocity
+            tot_hvp = hvp_data_fitting + hvp_reg.reshape(-1)
+        else:
+            tot_hvp = hvp_data_fitting
+        end = time.time()
+
+        second_derivative = -((tot_gradient / (1 + tot_gradient.T @ tot_gradient)) * (velocity.T @ tot_hvp)).flatten()
+
+        if return_hvp:
+            return second_derivative.reshape(-1, 1), tot_hvp.view(-1, 1)
+        else:
+            return second_derivative.reshape(-1, 1)
+
