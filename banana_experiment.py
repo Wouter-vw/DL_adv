@@ -29,7 +29,7 @@ import geomai.utils.geometry as geometry
 from torch import nn as nn_torch
 ########################################
 #from manifold import linearized_cross_entropy_manifold
-from manifoldwouter import linearized_cross_entropy_manifold, cross_entropy_manifold
+from manifold_kfac import linearized_cross_entropy_manifold, cross_entropy_manifold
 #########################################
 from tqdm import tqdm
 import sklearn.datasets
@@ -140,10 +140,13 @@ def main(args):
 
         @nn.compact
         def __call__(self, x):
+            self.sow('intermediates', 'in_0', x)
             x = nn.Dense(self.hidden_size)(x)
             x = nn.tanh(x)
+            self.sow('intermediates', 'in_1', x)
             x = nn.Dense(self.hidden_size)(x)
             x = nn.tanh(x)
+            self.sow('intermediates', 'in_2', x)
             x = nn.Dense(self.num_output)(x)
             return x
 
@@ -356,6 +359,7 @@ def main(args):
 
             else:
                 manifold = linearized_cross_entropy_manifold(
+                    model,
                     state_model_2,
                     x_train,
                     y_train,
@@ -368,6 +372,7 @@ def main(args):
         else:
             if batch_data:
                 manifold = linearized_cross_entropy_manifold(
+                    model,
                     state_model_2,
                     new_train_loader,
                     y=None,
@@ -380,6 +385,7 @@ def main(args):
 
             else:
                 manifold = linearized_cross_entropy_manifold(
+                    model,
                     state_model_2,
                     x_train,
                     y_train,
@@ -428,6 +434,7 @@ def main(args):
             if args.linearized_pred:
                 sub_f_MAP = f_MAP[idx_sub]
                 manifold = linearized_cross_entropy_manifold(
+                    model,
                     state_model_2,
                     sub_x_train,
                     sub_y_train,
