@@ -11,7 +11,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "-s=230",
+                "-s=0",
                 "-str=full",
                 "-sub=all",
                 "-samp=100",

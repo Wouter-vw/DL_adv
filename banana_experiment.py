@@ -5,17 +5,13 @@ File containing the banana experiments
 
 import torch
 import numpy as np
-import matplotlib
 import matplotlib.pyplot as plt
-import sys
 import sklearn.model_selection
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 
-from jax2torch import jax2torch
 from torch2jax import t2j
-from jax.scipy.stats import multivariate_normal
 import tensorflow as tf
 
 import flax.linen as nn
@@ -44,7 +40,6 @@ import argparse
 from torchmetrics.functional.classification import calibration_error
 import os
 
-from torchmetrics.functional.classification import calibration_error
 
 jax.config.update('jax_enable_x64', True)
 
@@ -117,7 +112,7 @@ def main(args):
         return batches
     
     # Create data loaders
-    batch_size_train = 1024
+    batch_size_train = 256
     batch_size_valid = 50
     batch_size_test = 50
     
@@ -125,6 +120,18 @@ def main(args):
     valid_loader = create_data_loader(x_valid, y_valid, batch_size=batch_size_valid, shuffle=False)
     test_loader = create_data_loader(x_test, y_test, batch_size=batch_size_test, shuffle=False)
     
+    if args.optimizer == "sgd":
+        learning_rate = 1e-3
+        weight_decay = 1e-2
+        optimizer = optax.sgd(learning_rate)
+        max_epoch = 1500
+    else:
+        learning_rate = 1e-3
+        weight_decay = 1e-3
+        optimizer = optax.adamw(learning_rate, weight_decay=weight_decay)
+        max_epoch = 1500  
+
+
     # Define your model using Flax
     class MLP(nn.Module):
         num_features: int
@@ -180,19 +187,8 @@ def main(args):
     num_output = 2
     H = 16
     model = MLP(num_features=num_features, hidden_size=H, num_output=num_output)
-    state = create_train_state(rng, model, optimizer=args.optimizer)
+    state = create_train_state(rng, model, optimizer=optimizer)
 
-
-    if args.optimizer == "sgd":
-        learning_rate = 1e-3
-        weight_decay = 1e-2
-        optimizer = optax.sgd(learning_rate)
-        max_epoch = 1500
-    else:
-        learning_rate = 1e-3
-        weight_decay = 1e-3
-        optimizer = optax.adamw(learning_rate, weight_decay=weight_decay)
-        max_epoch = 1500  
     for epoch in range(max_epoch):
         train_loss = 0.0
     
@@ -222,7 +218,6 @@ def main(args):
         return map_solution, unravel_fn
     
     map_solution, unravel_fn = get_map_solution(state)
-    test = unravel_fn(map_solution)
     state = state.replace(params = unravel_fn(map_solution))
 
     N_grid = 100
@@ -333,7 +328,7 @@ def main(args):
         state = state.replace(params = unravel_fn(map_solution))
         f_MAP = state.apply_fn(state.params, x_train)
 
-        state_model_2 = create_train_state(rng, model, optimizer=args.optimizer)
+        state_model_2 = create_train_state(rng, model, optimizer=optimizer)
         
         # here depending if I am using a diagonal approx, I have to redefine the model
         if batch_data:
@@ -396,7 +391,7 @@ def main(args):
                 )
     else:
         # here we have the usual manifold
-        state_model_2 = create_train_state(rng, model, optimizer=args.optimizer)
+        state_model_2 = create_train_state(rng, model, optimizer=optimizer)
 
         # here depending if I am using a diagonal approx, I have to redefine the model
         if optimize_prior:
