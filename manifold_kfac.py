@@ -139,8 +139,10 @@ class linearized_cross_entropy_manifold:
         # Compute K-FAC factors
         for i in range(num_layers):
             # Weight factors
-            A = intermediates['intermediates'][f'in_{i}'][0].T @ intermediates['intermediates'][f'in_{i}'][0]
-            G = ft_compute_grad['params'][f'Dense_{i}']['kernel'] @ ft_compute_grad['params'][f'Dense_{i}']['kernel'].T
+            A = jnp.matmul(intermediates['intermediates'][f'in_{i}'][0].T, intermediates['intermediates'][f'in_{i}'][0].T) /intermediates['intermediates'][f'in_{i}'][0].shape[0]
+            #A = intermediates['intermediates'][f'in_{i}'][0].T @ intermediates['intermediates'][f'in_{i}'][0]
+            G = jnp.matmul(ft_compute_grad['params'][f'Dense_{i}']['kernel'].T, ft_compute_grad['params'][f'Dense_{i}']['kernel']) /intermediates['intermediates'][f'in_{i}'][0].shape[0]
+            #G = ft_compute_grad['params'][f'Dense_{i}']['kernel'] @ ft_compute_grad['params'][f'Dense_{i}']['kernel'].T
             kfac_factors[f'layer_{i}'] = (G, A)
 
             # Bias factors
