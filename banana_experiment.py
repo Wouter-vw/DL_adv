@@ -123,8 +123,13 @@ def main(args):
     if args.optimizer == "sgd":
         learning_rate = 1e-3
         weight_decay = 1e-2
-        optimizer = optax.sgd(learning_rate)
-        max_epoch = 1500
+        max_epoch = 2000
+
+        # Define the optimizer with weight decay
+        optimizer = optax.chain(
+            optax.add_decayed_weights(weight_decay),  # Apply weight decay
+            optax.sgd(learning_rate)                  # SGD optimizer
+        )
     else:
         learning_rate = 1e-3
         weight_decay = 1e-3
@@ -321,6 +326,40 @@ def main(args):
         scale_tril = scale_tril = jnp.array(la.posterior_scale)
         V_LA = jax.random.multivariate_normal(rng, mean=jnp.zeros_like(map_solution), cov=scale_tril @ scale_tril.T, shape=(n_posterior_samples,))
         print(V_LA.shape)
+
+    @jax.jit
+    def rearrange_V_LA(test):
+        # Initialize the output array
+        V_LA_jax = jnp.zeros(354, dtype=test.dtype)
+
+        # Assign the first slice
+        V_LA_jax = V_LA_jax.at[0:16].set(test[32:48])
+
+        # Interleave even and odd indices
+        even_indices = test[0:32:2]
+        odd_indices = test[1:32:2]
+        V_LA_jax = V_LA_jax.at[16:48].set(jnp.concatenate([even_indices, odd_indices], axis=0))
+
+        # Assign the next slice
+        V_LA_jax = V_LA_jax.at[48:64].set(test[304:320])
+
+        # Rearrange test[48:304]
+        num_rows = (304 - 48) // 16
+        indices = jnp.arange(num_rows * 16).reshape(16, num_rows).T.flatten()
+        V_LA_jax = V_LA_jax.at[64:320].set(test[48:304][indices])
+
+        # Assign test[352:354]
+        V_LA_jax = V_LA_jax.at[320:322].set(test[352:354])
+
+        # Rearrange test[320:352]
+        test_test = test[320:352]
+        indices_2 = jnp.arange(test_test.size).reshape(-1, 16).T.flatten()
+        V_LA_jax = V_LA_jax.at[322:354].set(test_test[indices_2])
+
+        return V_LA_jax
+
+    for n in range(n_posterior_samples):
+        V_LA = V_LA.at[n, :].set(rearrange_V_LA(V_LA[n, :]))
 
     #  ok now I have the initial velocities. I can therefore consider my manifold
     if args.linearized_pred:
