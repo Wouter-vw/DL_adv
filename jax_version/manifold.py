@@ -19,103 +19,42 @@ import copy
 import optax
 from dataclasses import dataclass
 
-@dataclass(frozen=True)
-class LayerInfo:
-    layer_name: str
-    kernel_shape: tuple
-    bias_shape: tuple
-    kernel_idx: int
-    bias_idx: int
-    kernel_size: int
-    bias_size: int
+@jax.jit
+def L2_norm(lambda_reg, params):
+    if lambda_reg is None:
+        return 0.0
+    w_norm = sum([jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params)])
+    return lambda_reg * w_norm
 
-def precompute_param_info(state):
-    param_info = []
-    idx = 0
-    for layer_name, layer_params in state.params['params'].items():
-        kernel_shape = layer_params['kernel'].shape  # Should be a tuple
-        bias_shape = layer_params['bias'].shape      # Should be a tuple
-        kernel_size = int(kernel_shape[0] * kernel_shape[1])
-        bias_size = int(bias_shape[0])
-        info = LayerInfo(
-            layer_name=layer_name,
-            kernel_shape=kernel_shape,
-            bias_shape=bias_shape,
-            kernel_idx=idx,
-            bias_idx=idx + kernel_size,
-            kernel_size=kernel_size,
-            bias_size=bias_size
-        )
-        param_info.append(info)
-        idx += kernel_size + bias_size
-    return tuple(param_info)  # Convert list to tuple to make it hashable
+@jax.jit
+def compute_grad_L2_reg(lambda_reg, params):
+        if lambda_reg is None:
+            return None
+        reg_fn = lambda p: L2_norm(lambda_reg, p)
+        grad_fn = grad(reg_fn)
+        grad_params = grad_fn(params)
+        return grad_params
 
+@jax.jit
+def CE_loss_lin_CEM(params, data, f_MAP, theta_MAP, model_apply_fn, factor=None):
+    x, y = data
+    # Compute difference between params and theta_MAP
+    diff_params = jax.tree_util.tree_map(lambda a, b: a - b, params, theta_MAP)
+    # Compute jvp
+    _, jvp_value = jvp(lambda p: model_apply_fn(p, x), (theta_MAP,), (diff_params,))
+    logits = f_MAP + jvp_value
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+    loss = jnp.sum(loss)
+    if factor is not None:
+        loss *= factor
+    return loss
 
-@partial(jax.jit, static_argnums=(1,))
-def params_from_map_info(solution, param_info):
-    params = {'params': {}}
-    for info in param_info:
-        # Extract and reshape kernel using dynamic slicing
-        kernel_flat = jax.lax.dynamic_slice(
-            solution,
-            [info.kernel_idx],
-            [info.kernel_size]
-        )
-        kernel = kernel_flat.reshape(info.kernel_shape)
-
-        # Extract and reshape bias using dynamic slicing
-        bias_flat = jax.lax.dynamic_slice(
-            solution,
-            [info.bias_idx],
-            [info.bias_size]
-        )
-        bias = bias_flat.reshape(info.bias_shape)
-
-        # Assign to params
-        params['params'][info.layer_name] = {
-            'kernel': kernel,
-            'bias': bias
-        }
-
-    return flax.core.FrozenDict(params)
-
-
-def params_from_map(solution, state):
-        params = {'params': {}}
-        idx = 0
-
-        # Iterate over the layers to reconstruct the parameters dynamically
-        for layer_name, layer_params in state.params['params'].items():
-            # Get the shape of the kernel and bias
-            kernel_shape = layer_params['kernel'].shape
-            bias_shape = layer_params['bias'].shape
-            
-            # Calculate the number of elements in the kernel and bias
-            kernel_size = jnp.prod(jnp.array(kernel_shape))
-            bias_size = jnp.prod(jnp.array(bias_shape))
-
-
-            # Extract and reshape kernel from solution
-            kernel_flat = solution[idx:idx + kernel_size]
-            if kernel_flat.size == 0:
-                raise ValueError(f"Not enough elements in solution for layer {layer_name} kernel.")
-            kernel = kernel_flat.reshape(kernel_shape)
-            idx += kernel_size
-            
-            # Extract and reshape bias from map_solution
-            bias_flat = solution[idx:idx + bias_size]
-            if bias_flat.size == 0:
-                raise ValueError(f"Not enough elements in solution for layer {layer_name} bias.")
-            bias = bias_flat.reshape(bias_shape)
-            idx += bias_size
-            
-            # Assign the kernel and bias to the params dictionary
-            params['params'][layer_name] = {'kernel': kernel, 'bias': bias}
-        
-        # Replace the state with the new params
-        new_state = state.replace(params=params)
-
-        return new_state
+@partial(jax.jit, static_argnums=(4))
+def compute_grad_data_fitting_term_lin_CEM(params, data, f_MAP, theta_MAP, apply_fn, factor=None):
+    loss_fn = lambda p: CE_loss_lin_CEM(p, data, f_MAP, theta_MAP, apply_fn, factor)
+    grad_fn = grad(loss_fn)
+    grad_params = grad_fn(params)
+    return grad_params
 
 def custom_hvp(f, primals, tangents):
     return jax.jvp(jax.grad(f), primals, tangents)[1]
@@ -292,11 +231,11 @@ class linearized_regression_manifold:
     def is_diagonal():
         return False
 
-    def L2_norm(self, params):
-        if self.lambda_reg is None:
-            return 0.0
-        w_norm = sum([jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params)])
-        return self.lambda_reg * w_norm
+    # def L2_norm(self, params):
+    #     if self.lambda_reg is None:
+    #         return 0.0
+    #     w_norm = sum([jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params)])
+    #     return self.lambda_reg * w_norm
 
     def mse_loss(self, params, data, f_MAP):
         x, y = data
@@ -606,7 +545,7 @@ class linearized_cross_entropy_manifold:
                 self.factor *= (B2 / B1)
 
         # Initialize model parameters
-        self.params = theta_MAP
+        self.params = model.params
         self.n_params, self.unravel_fn = self.get_num_params(self.params)
 
     def get_num_params(self, params):
@@ -618,13 +557,13 @@ class linearized_cross_entropy_manifold:
     def is_diagonal():
         return False
 
-    @partial(jax.jit, static_argnums=(0, 5))
-    def CE_loss(self, params, data, f_MAP, theta_MAP, jvp_fn, factor=None):
+    @partial(jax.jit, static_argnums=(0))
+    def CE_loss(self, params, data, f_MAP, theta_MAP, factor=None):
         x, y = data
         # Compute difference between params and theta_MAP
-        diff_params = jax.tree_util.tree_map(lambda a, b: jnp.asarray(a - b, dtype=jnp.float32), params, self.theta_MAP)
+        diff_params = jax.tree_util.tree_map(lambda a, b: a - b, params, theta_MAP)
         # Compute jvp
-        _, jvp_value = jvp(jvp_fn, (theta_MAP,), (diff_params,))
+        _, jvp_value = jvp(lambda p: self.model.apply_fn(p, x), (theta_MAP,), (diff_params,))
         logits = f_MAP + jvp_value
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
         loss = jnp.sum(loss)
@@ -632,26 +571,28 @@ class linearized_cross_entropy_manifold:
             loss *= factor
         return loss
 
-    def L2_norm(self, params):
-        if self.lambda_reg is None:
-            return 0.0
-        w_norm = sum([jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params)])
-        return self.lambda_reg * w_norm
+    # @partial(jax.jit, static_argnums=(0))
+    # def L2_norm(self, params):
+    #     if self.lambda_reg is None:
+    #         return 0.0
+    #     w_norm = sum([jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params)])
+    #     return self.lambda_reg * w_norm
 
-    @partial(jax.jit, static_argnums=(0, 5))
-    def compute_grad_data_fitting_term(self, params, data, f_MAP, theta_MAP, jvp_fn, factor=None):
-        loss_fn = lambda p: self.CE_loss(p, data, f_MAP, theta_MAP, jvp_fn, factor)
+    @partial(jax.jit, static_argnums=(0))
+    def compute_grad_data_fitting_term(self, params, data, f_MAP, theta_MAP, factor=None):
+        loss_fn = lambda p: self.CE_loss(p, data, f_MAP, theta_MAP, factor)
         grad_fn = grad(loss_fn)
         grad_params = grad_fn(params)
         return grad_params
 
-    def compute_grad_L2_reg(self, params):
-        if self.lambda_reg is None:
-            return None
-        reg_fn = lambda p: self.L2_norm(p)
-        grad_fn = grad(reg_fn)
-        grad_params = grad_fn(params)
-        return grad_params
+    # @partial(jax.jit, static_argnums=(0))
+    # def compute_grad_L2_reg(self, params):
+    #     if self.lambda_reg is None:
+    #         return None
+    #     reg_fn = lambda p: self.L2_norm(self.lambda_reg, p)
+    #     grad_fn = grad(reg_fn)
+    #     grad_params = grad_fn(params)
+    #     return grad_params
 
     # @profile
     def geodesic_system(self, current_point, velocity, return_hvp=False):
@@ -659,35 +600,15 @@ class linearized_cross_entropy_manifold:
         params = self.unravel_fn(current_point)
         velocity_params = self.unravel_fn(velocity)
 
-        param_info = precompute_param_info(self.model)
-
+        theta_MAP_params = self.unravel_fn(self.theta_MAP)
+        theta_MAP_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.float64), theta_MAP_params)
 
         # Compute gradient of data fitting term
-        if self.batching:
-            grad_data_fitting_term = None
-            for batch_x, batch_y, batch_f_MAP in self.X:
-                data = (batch_x, batch_y)
-                def jvp_fn(p):
-                    state = params_from_map_info(p, param_info)
-                    return self.model.apply_fn(state.params, batch_x)
-
-                grad_per_batch = self.compute_grad_data_fitting_term(params, data, batch_f_MAP, self.theta_MAP, jvp_fn, self.factor)
-                if grad_data_fitting_term is None:
-                    grad_data_fitting_term = grad_per_batch
-                else:
-                    grad_data_fitting_term = jax.tree_util.tree_map(
-                        lambda x, y: x + y, grad_data_fitting_term, grad_per_batch
-                    )
-        else:
-            data = (self.X, self.y)
-            def jvp_fn(p):
-                state = params_from_map_info(p, param_info)
-                return self.model.apply_fn(state["params"], self.X)
-
-            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP, self.theta_MAP, jvp_fn, self.factor)
+        data = (self.X, self.y)
+        grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP, theta_MAP_params, self.factor)
 
         # Compute gradient of L2 regularization
-        grad_reg = self.compute_grad_L2_reg(params)
+        grad_reg = compute_grad_L2_reg(self.lambda_reg, params)
         if grad_reg is not None:
             total_grad = jax.tree_util.tree_map(
                 lambda x, y: x + y, grad_data_fitting_term, grad_reg
@@ -699,19 +620,18 @@ class linearized_cross_entropy_manifold:
         flat_total_grad, _ = jax.flatten_util.ravel_pytree(total_grad)
 
         # Define total loss function
-        def total_loss_fn(p):
-            return self.CE_loss(p, data, self.f_MAP) + self.L2_norm(p)
+        def total_loss_fn(p, data, f_MAP, theta_MAP_params, lambda_reg):
+            return self.CE_loss(p, data, f_MAP, theta_MAP_params) + L2_norm(lambda_reg, p)
 
-        # Compute Hessian-vector product
-        # hvp_fn = lambda v: jax.jvp(grad(total_loss_fn), (params,), (v,))[1]
-        jit_grad_total_loss_fn = jax.jit(grad(total_loss_fn))
+
+        grad_total_loss_fn = jax.jit(grad(total_loss_fn))
 
         @jax.jit
-        def hvp_fn(v):
-            _, hvp = jax.jvp(jit_grad_total_loss_fn, (params,), (v,))
-            return hvp
+        def hvp_fn(p, v, data, f_MAP, theta_MAP_params, lambda_reg):
+            return jvp(lambda p: grad_total_loss_fn(p, data, f_MAP, theta_MAP_params, lambda_reg), (p,),(v,))[1]
         
-        hvp_params = hvp_fn(velocity_params)
+        hvp_params = hvp_fn(params,velocity_params,data,self.f_MAP,theta_MAP_params, self.lambda_reg)
+
         flat_hvp, _ = jax.flatten_util.ravel_pytree(hvp_params)
 
         # Compute second derivative
