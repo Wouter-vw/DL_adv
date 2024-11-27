@@ -121,7 +121,7 @@ class linearized_cross_entropy_manifold:
         ft_per_sample_grads = ft_compute_grad(params)
         return ft_per_sample_grads
     
-    @partial(jax.jit, static_argnums=(0,))
+    @partial(jax.jit, static_argnums=(0,4))
     def compute_kfac_hvp(self, intermediates, ft_compute_grad, vel_as_params, num_layers=3):
         """
         Compute the Hessian-vector product (HVP) using K-FAC approximation.
@@ -135,33 +135,33 @@ class linearized_cross_entropy_manifold:
         Returns:
             jnp.ndarray: Hessian-vector product.
         """
-        kfac_factors = {}
-
-        # Compute K-FAC factors
-        for i in range(num_layers):
-            # Weight factors
-            A = jnp.matmul(intermediates['intermediates'][f'in_{i}'][0].T, intermediates['intermediates'][f'in_{i}'][0]) /intermediates['intermediates'][f'in_{i}'][0].shape[0]
-            #A = intermediates['intermediates'][f'in_{i}'][0].T @ intermediates['intermediates'][f'in_{i}'][0]
-            G = jnp.matmul(ft_compute_grad['params'][f'Dense_{i}']['kernel'].T, ft_compute_grad['params'][f'Dense_{i}']['kernel']) /intermediates['intermediates'][f'in_{i}'][0].shape[0]
-            #G = ft_compute_grad['params'][f'Dense_{i}']['kernel'] @ ft_compute_grad['params'][f'Dense_{i}']['kernel'].T
-            kfac_factors[f'layer_{i}'] = (G, A)
-
-            # Bias factors
-            G_bias = ft_compute_grad['params'][f'Dense_{i}']['bias']
-            A_bias = jnp.ones(G_bias.shape[0])
-            kfac_factors[f'bias_{i}'] = (G_bias, A_bias)
-
-        # Compute HVP
         hvp_list = []
+
         for i in range(num_layers):
-            # Bias contribution
-            bias = kfac_factors[f'bias_{i}'][0] * vel_as_params['params'][f'Dense_{i}']['bias']
-            # Weight contribution
-            weight = jnp.matmul(
-                kfac_factors[f'layer_{i}'][1],
-                jnp.matmul(vel_as_params['params'][f'Dense_{i}']['kernel'], kfac_factors[f'layer_{i}'][0])
-            )
-            hvp_list.extend([bias, weight.flatten()])
+            layer_name = f'Dense_{i}'
+            interm_key = f'in_{i}'
+
+            # Extract activations and gradients
+            activations = intermediates['intermediates'][interm_key][0]  # Shape: (batch_size, n_in)
+            grads = ft_compute_grad['params'][layer_name]['kernel']      # Shape: (n_in, n_out)
+            vel = vel_as_params['params'][layer_name]['kernel']          # Shape: (n_in, n_out)
+
+            # Compute activation covariance A
+            A = jnp.matmul(activations.T, activations) / activations.shape[0]  # Shape: (n_in, n_in)
+
+            # Compute gradient covariance G
+            G = jnp.matmul(grads.T, grads) / activations.shape[0]              # Shape: (n_out, n_out)
+
+            # Compute HVP for weights
+            weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
+            hvp_list.append(weight_hvp.flatten())
+
+            # Bias terms
+            grads_bias = ft_compute_grad['params'][layer_name]['bias']   # Shape: (n_out,)
+            vel_bias = vel_as_params['params'][layer_name]['bias']       # Shape: (n_out,)
+            G_bias = (grads_bias ** 2) / activations.shape[0]            # Shape: (n_out,)
+            bias_hvp = G_bias * vel_bias                                 # Element-wise multiplication
+            hvp_list.append(bias_hvp.flatten())
 
         return jnp.concatenate(hvp_list)
     
@@ -190,10 +190,7 @@ class linearized_cross_entropy_manifold:
                 grad_data_fitting_term += grad_per_example.reshape(-1, 1)
         else:
             params = self.unravel_fn(current_point)
-            self.params_map = self.unravel_fn(self.theta_MAP)
-            
-            # grad_per_example = jax.flatten_util.ravel_pytree(self.compute_grad_data_fitting_term(params, data, self.f_MAP))[0]
-            # grad_data_fitting_term = grad_per_example.reshape(-1, 1)
+            self.params_map = self.unravel_fn(self.theta_MAP)            
             grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
             
         end = time.time()
@@ -250,7 +247,8 @@ class cross_entropy_manifold:
     """
 
     def __init__(
-        self, 
+        self,
+        model, 
         state_model, 
         X, 
         y,
@@ -261,6 +259,7 @@ class cross_entropy_manifold:
         B1=None, 
         B2=None
     ):
+        self.model = model
         self.state = state_model
         self.X = X
         self.y = y
@@ -324,19 +323,63 @@ class cross_entropy_manifold:
         ft_compute_grad = grad(self.CE_loss)
 
         ft_per_sample_grads = ft_compute_grad(params, data)
-        return jax.flatten_util.ravel_pytree(ft_per_sample_grads)[0]
+        return ft_per_sample_grads
 
     @partial(jax.jit, static_argnums=(0))
     def compute_grad_L2_reg(self, params):
         ft_compute_grad = grad(self.L2_norm)
         ft_per_sample_grads = ft_compute_grad(params)
-        return jax.flatten_util.ravel_pytree(ft_per_sample_grads)[0]
+        return ft_per_sample_grads
     
     @partial(jax.jit, static_argnums=(0, 1))
     def custom_hvp(self, f, primals, tangents):
         grad_f = grad(f)
         return jax.jvp(grad_f, primals, tangents)
     
+    @partial(jax.jit, static_argnums=(0,4))
+    def compute_kfac_hvp(self, intermediates, ft_compute_grad, vel_as_params, num_layers=3):
+        """
+        Compute the Hessian-vector product (HVP) using K-FAC approximation.
+        
+        Args:
+            intermediates (dict): Intermediate activations from the forward pass.
+            ft_compute_grad (dict): Gradients of the parameters.
+            vel_as_params (dict): Velocity vector in parameter space.
+            num_layers (int): Number of layers to process.
+
+        Returns:
+            jnp.ndarray: Hessian-vector product.
+        """
+        hvp_list = []
+
+        for i in range(num_layers):
+            layer_name = f'Dense_{i}'
+            interm_key = f'in_{i}'
+
+            # Extract activations and gradients
+            activations = intermediates['intermediates'][interm_key][0]  # Shape: (batch_size, n_in)
+            grads = ft_compute_grad['params'][layer_name]['kernel']      # Shape: (n_in, n_out)
+            vel = vel_as_params['params'][layer_name]['kernel']          # Shape: (n_in, n_out)
+
+            # Compute activation covariance A
+            A = jnp.matmul(activations.T, activations) / activations.shape[0]  # Shape: (n_in, n_in)
+
+            # Compute gradient covariance G
+            G = jnp.matmul(grads.T, grads) / activations.shape[0]              # Shape: (n_out, n_out)
+
+            # Compute HVP for weights
+            weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
+            hvp_list.append(weight_hvp.flatten())
+
+            # Bias terms
+            grads_bias = ft_compute_grad['params'][layer_name]['bias']   # Shape: (n_out,)
+            vel_bias = vel_as_params['params'][layer_name]['bias']       # Shape: (n_out,)
+            G_bias = (grads_bias ** 2) / activations.shape[0]            # Shape: (n_out,)
+            bias_hvp = G_bias * vel_bias                                 # Element-wise multiplication
+            hvp_list.append(bias_hvp.flatten())
+
+        return jnp.concatenate(hvp_list)
+  
     @partial(jax.jit, static_argnums=(0,))
     def geodesic_system(self, current_point, velocity, return_hvp=False):
         if isinstance(self.X, tf.data.Dataset):
@@ -359,20 +402,21 @@ class cross_entropy_manifold:
                 grad_data_fitting_term += grad_per_example.reshape(-1, 1)
         else:
             params = self.unravel_fn(current_point)
-            grad_per_example = self.compute_grad_data_fitting_term(params, data)
-            grad_data_fitting_term = grad_per_example.reshape(-1, 1)
+            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data)
         end = time.time()
 
         # here now I have to compute also the gradient of the regularization term
         if self.lambda_reg is not None:
             # I have to compute the L2 reg gradient
             grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = grad_reg.reshape(-1, 1)
-
         else:
-            grad_reg = 0
+            grad_reg = None
 
-        tot_gradient = grad_data_fitting_term + grad_reg
+        tot_gradient = grad_data_fitting_term
+        if grad_reg is not None:
+            tot_gradient = jax.tree_util.tree_map(lambda x, y: x + y, tot_gradient, grad_reg)
+
+        tot_gradient = jax.flatten_util.ravel_pytree(tot_gradient)[0]
 
         # and I have to reshape the velocity into being the same structure as the params
         vel_as_params = self.unravel_fn(velocity)
@@ -381,25 +425,17 @@ class cross_entropy_manifold:
         start = time.time()
         hvp_data_fitting = 0
         if batchify:
-            for batch_img, batch_label in self.X:
-                _, result = self.custom_hvp(
-                    self.CE_loss,
-                    (params, (batch_img, batch_label)),
-                    (vel_as_params, (jnp.zeros_like(batch_img), jnp.zeros_like(batch_label))),
-                )
-            
-            hvp_data_fitting += jax.flatten_util.ravel_pytree(result)[0]
-
+            for batch_img, batch_label, batch_f_MAP in self.X:
+                _, intermediates = self.model.apply(state.params, batch_img, mutable=['intermediates'])
+                hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
         else:
-            _, result = self.custom_hvp(
-                self.CE_loss, (params, data), (vel_as_params, (jnp.zeros_like(data[0]), jnp.zeros(data[1].shape, dtype=jax.dtypes.float0)))
-            )
-        
-            hvp_data_fitting += jax.flatten_util.ravel_pytree(result)[0]
+            _, intermediates = self.model.apply(state.params, data[0], mutable=['intermediates'])
+            hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
 
-
+        # I have to add the hvp of the regularization term
         if self.lambda_reg is not None:
             hvp_reg = 2 * self.lambda_reg * velocity
+
             tot_hvp = hvp_data_fitting + hvp_reg.reshape(-1)
         else:
             tot_hvp = hvp_data_fitting

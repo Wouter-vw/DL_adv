@@ -387,6 +387,7 @@ def main(args):
         if optimize_prior:
             if batch_data:
                 manifold = linearized_cross_entropy_manifold(
+                    model,
                     state_model_2,
                     new_train_loader,
                     y=None,
@@ -443,22 +444,22 @@ def main(args):
         if optimize_prior:
             if batch_data:
                 manifold = cross_entropy_manifold(
-                    state_model_2, train_loader, y=None, unravel_fn=unravel_fn, batching=True, lambda_reg=la.prior_precision.item() / 2
+                    model, state_model_2, train_loader, y=None, unravel_fn=unravel_fn, batching=True, lambda_reg=la.prior_precision.item() / 2
                 )
 
             else:
                 manifold = cross_entropy_manifold(
-                    state_model_2, x_train, y_train, unravel_fn=unravel_fn, batching=False, lambda_reg=la.prior_precision.item() / 2
+                    model, state_model_2, x_train, y_train, unravel_fn=unravel_fn, batching=False, lambda_reg=la.prior_precision.item() / 2
                 )
         else:
             if batch_data:
                 manifold = cross_entropy_manifold(
-                    state_model_2, train_loader, y=None, unravel_fn=unravel_fn, batching=True, lambda_reg=weight_decay
+                    model, state_model_2, train_loader, y=None, unravel_fn=unravel_fn, batching=True, lambda_reg=weight_decay
                 )
 
             else:
                 manifold = cross_entropy_manifold(
-                    state_model_2, x_train, y_train, unravel_fn=unravel_fn, batching=False, lambda_reg=weight_decay
+                    model, state_model_2, x_train, y_train, unravel_fn=unravel_fn, batching=False, lambda_reg=weight_decay
                 )
     # now i have my manifold and so I can solve the expmap
     weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
@@ -488,6 +489,7 @@ def main(args):
                 )
             else:
                 manifold = cross_entropy_manifold(
+                    model,
                     state_model_2,
                     sub_x_train,
                     sub_y_train,
