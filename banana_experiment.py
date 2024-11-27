@@ -3,7 +3,7 @@ File containing the banana experiments
 """
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -15,6 +15,7 @@ import optax
 
 from neural_network import MLP, create_train_state, compute_loss, train_step
 from data_loading import load_banana_data, create_data_loader
+from plots import plot_map_confidence, plot_ours_confidence
 
 from laplace import Laplace
 import seaborn as sns
@@ -136,28 +137,7 @@ def main(args):
 
     conf = probs_map.max(1)
 
-    # Plotting
-    plt.contourf(
-        XX1,
-        XX2,
-        conf.reshape(N_grid, N_grid),
-        alpha=0.8,
-        antialiased=True,
-        cmap="Blues",
-        levels=jnp.arange(0.0, 1.01, 0.1),
-    )
-    plt.colorbar()
-    plt.scatter(
-        x_train[:, 0][y_train == 0], x_train[:, 1][y_train == 0], c="orange", edgecolors="black", s=45, alpha=1
-    )
-    plt.scatter(
-        x_train[:, 0][y_train == 1], x_train[:, 1][y_train == 1], c="violet", edgecolors="black", s=45, alpha=1
-    )
-    plt.title("Confidence MAP")
-    plt.xticks([], [])
-    plt.yticks([], [])
-    plt.show()
-
+    plot_map_confidence(x_train, y_train, XX1, XX2, conf, title="Confidence MAP")
 
     ## Quick import of pytorch model for the laplace package!
     model_torch= nn_torch.Sequential(
@@ -429,42 +409,9 @@ def main(args):
         P_grid_OURS_lin /= n_posterior_samples
         P_grid_OUR_conf = P_grid_OURS_lin.max(1)
 
-        plt.contourf(
-            XX1,
-            XX2,
-            P_grid_OUR_conf.reshape(N_grid, N_grid),
-            alpha=0.8,
-            antialiased=True,
-            cmap="Blues",
-            levels=np.arange(0.0, 1.01, 0.1),
-            zorder=-10,
+        plot_ours_confidence(
+            x_train, y_train, XX1, XX2, P_grid_OUR_conf, P_grid_OURS_lin[:, 0], title="Confidence OURS linearized"
         )
-
-        plt.scatter(
-            x_train[:, 0][y_train == 0],
-            x_train[:, 1][y_train == 0],
-            c="orange",
-            edgecolors="black",
-            s=45,
-            alpha=1,
-            zorder=10,
-        )
-        plt.scatter(
-            x_train[:, 0][y_train == 1],
-            x_train[:, 1][y_train == 1],
-            c="violet",
-            edgecolors="black",
-            s=45,
-            alpha=1,
-            zorder=10,
-        )
-        plt.contour(
-            XX1, XX2, P_grid_OURS_lin[:, 0].reshape(N_grid, N_grid), levels=[0.5], colors="k", alpha=0.5, zorder=0
-        )
-        plt.xticks([], [])
-        plt.yticks([], [])
-        plt.title("All weights, full Hessian approx - Confidence OUR linearized")
-        plt.show()
 
         # now I can do the same for our method
         for n in range(n_posterior_samples):
@@ -498,40 +445,9 @@ def main(args):
         P_grid_OUR /= n_posterior_samples
         P_grid_OUR_conf = P_grid_OUR.max(1)
 
-        plt.contourf(
-            XX1,
-            XX2,
-            P_grid_OUR_conf.reshape(N_grid, N_grid),
-            alpha=0.8,
-            antialiased=True,
-            cmap="Blues",
-            levels=np.arange(0.0, 1.01, 0.1),
-            zorder=-10,
+        plot_ours_confidence(
+            x_train, y_train, XX1, XX2, P_grid_OUR_conf, P_grid_OUR[:, 0], title="Confidence OURS"
         )
-
-        plt.scatter(
-            x_train[:, 0][y_train == 0],
-            x_train[:, 1][y_train == 0],
-            c="orange",
-            edgecolors="black",
-            s=45,
-            alpha=1,
-            zorder=10,
-        )
-        plt.scatter(
-            x_train[:, 0][y_train == 1],
-            x_train[:, 1][y_train == 1],
-            c="violet",
-            edgecolors="black",
-            s=45,
-            alpha=1,
-            zorder=10,
-        )
-        plt.contour(XX1, XX2, P_grid_OUR[:, 0].reshape(N_grid, N_grid), levels=[0.5], colors="k", alpha=0.5, zorder=0)
-        plt.title("All weights, full Hessian approx - Confidence OURS")
-        plt.xticks([], [])
-        plt.yticks([], [])
-        plt.show()
 
         P_test_OURS = 0
         for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
@@ -554,12 +470,6 @@ def main(args):
     #mce_our = calibration_error(P_test_OURS, y_test, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
 
     print(f"Results OURS: accuracy {accuracy_OURS}, nll {nll_OUR}, brier {brier_OURS}, ECE {ece_our}, MCE {mce_our}")
-    # now I can create my dictionary
-    #dict_OUR = {"Accuracy": accuracy_OURS, "NLL": nll_OUR, "Brier": brier_OURS, "ECE": ece_our, "MCE": mce_our}
-    #print(f"Results OURS: accuracy {accuracy_OURS}, nll {nll_OUR}, brier {brier_OURS}")
-    # now I can create my dictionary
-    #dict_OUR = {"Accuracy": accuracy_OURS, "NLL": nll_OUR, "Brier": brier_OURS}
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Geomeatric Approximate Inference (GEOMAI)")
