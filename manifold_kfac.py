@@ -121,56 +121,49 @@ class linearized_cross_entropy_manifold:
         ft_per_sample_grads = ft_compute_grad(params)
         return ft_per_sample_grads
     
+    @partial(jax.jit, static_argnums=(0,))
     def compute_kfac_hvp(self, intermediates, ft_compute_grad, vel_as_params, num_layers=3):
+        """
+        Compute the Hessian-vector product (HVP) using K-FAC approximation.
+        
+        Args:
+            intermediates (dict): Intermediate activations from the forward pass.
+            ft_compute_grad (dict): Gradients of the parameters.
+            vel_as_params (dict): Velocity vector in parameter space.
+            num_layers (int): Number of layers to process.
+
+        Returns:
+            jnp.ndarray: Hessian-vector product.
+        """
         kfac_factors = {}
 
+        # Compute K-FAC factors
         for i in range(num_layers):
-            layer_name = f'Dense_{i}'
-
-            # Extract activations for the current layer
-            activation = intermediates['intermediates'][f'in_{i}'][0]  # Shape: (batch_size, layer_dim)
-            # Compute A (Activation covariance)
-            A = jnp.matmul(activation.T, activation) / activation.shape[0]  # Shape: (layer_dim, layer_dim)
-
-            # Extract gradients for the current layer
-            grad = ft_compute_grad['params'][layer_name]['kernel']  # Shape: (input_dim, output_dim)
-            # Reshape gradients if necessary
-            grad = grad.reshape(-1, grad.shape[-1])  # Ensure it's 2D
-            # Compute G (Gradient covariance)
-            G = jnp.matmul(grad.T, grad) / grad.shape[0]  # Shape: (output_dim, output_dim)
-
-            kfac_factors[layer_name] = (G, A)
+            # Weight factors
+            A = jnp.matmul(intermediates['intermediates'][f'in_{i}'][0].T, intermediates['intermediates'][f'in_{i}'][0]) /intermediates['intermediates'][f'in_{i}'][0].shape[0]
+            #A = intermediates['intermediates'][f'in_{i}'][0].T @ intermediates['intermediates'][f'in_{i}'][0]
+            G = jnp.matmul(ft_compute_grad['params'][f'Dense_{i}']['kernel'].T, ft_compute_grad['params'][f'Dense_{i}']['kernel']) /intermediates['intermediates'][f'in_{i}'][0].shape[0]
+            #G = ft_compute_grad['params'][f'Dense_{i}']['kernel'] @ ft_compute_grad['params'][f'Dense_{i}']['kernel'].T
+            kfac_factors[f'layer_{i}'] = (G, A)
 
             # Bias factors
-            grad_bias = ft_compute_grad['params'][layer_name]['bias']  # Shape: (output_dim,)
-            G_bias = jnp.outer(grad_bias, grad_bias) / grad_bias.shape[0]  # Shape: (output_dim, output_dim)
-            A_bias = jnp.ones((1, 1))  # Since bias activations are 1
+            G_bias = ft_compute_grad['params'][f'Dense_{i}']['bias']
+            A_bias = jnp.ones(G_bias.shape[0])
+            kfac_factors[f'bias_{i}'] = (G_bias, A_bias)
 
-            kfac_factors[f'{layer_name}_bias'] = (G_bias, A_bias)
-
-        # Compute Hessian-vector product using K-FAC approximation
+        # Compute HVP
         hvp_list = []
         for i in range(num_layers):
-            layer_name = f'Dense_{i}'
-
-            # Extract Kronecker factors
-            G, A = kfac_factors[layer_name]
-            G_bias, A_bias = kfac_factors[f'{layer_name}_bias']
-
-            # Extract velocities for current layer
-            v = vel_as_params['params'][layer_name]['kernel']
-            v_bias = vel_as_params['params'][layer_name]['bias']
-
-            # Compute HVP for weights
-            v_out = jnp.matmul(A, jnp.matmul(G, v.T))
-            hvp_list.append(v_out.flatten())
-
-            # Compute HVP for biases
-            v_bias_out = G_bias @ v_bias  # Since A_bias is scalar 1, can omit
-            hvp_list.append(v_bias_out.flatten())
+            # Bias contribution
+            bias = kfac_factors[f'bias_{i}'][0] * vel_as_params['params'][f'Dense_{i}']['bias']
+            # Weight contribution
+            weight = jnp.matmul(
+                kfac_factors[f'layer_{i}'][1],
+                jnp.matmul(vel_as_params['params'][f'Dense_{i}']['kernel'], kfac_factors[f'layer_{i}'][0])
+            )
+            hvp_list.extend([bias, weight.flatten()])
 
         return jnp.concatenate(hvp_list)
-
     
     @partial(jax.jit, static_argnums=(0,))
     def geodesic_system(self, current_point, velocity, return_hvp=False):
