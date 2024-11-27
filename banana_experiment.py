@@ -1,12 +1,9 @@
 """
 File containing the banana experiments
 """
-
-
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-import sklearn.model_selection
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -14,32 +11,24 @@ import jax.random as jrandom
 from torch2jax import t2j
 import tensorflow as tf
 
-import flax.linen as nn
-from flax import struct
-from flax.training import train_state
 import optax
 
+from neural_network import MLP, create_train_state, compute_loss, train_step
+from data_loading import load_banana_data, create_data_loader
+
 from laplace import Laplace
-import matplotlib.colors as colors
 import seaborn as sns
 #####################################
 import geomai.utils.geometry as geometry
-#import geomai.utils.geometry_diffrax as geometry
 ####################################################
 from torch import nn as nn_torch
 ########################################
-#from manifold import linearized_cross_entropy_manifold
-# from manifoldwouter import linearized_cross_entropy_manifold, cross_entropy_manifold
 from manifold_kfac import linearized_cross_entropy_manifold, cross_entropy_manifold
 #########################################
 from tqdm import tqdm
-import sklearn.datasets
-from datautils import make_pinwheel_data
-from utils.metrics import accuracy, nll, brier, calibration
-from sklearn.metrics import brier_score_loss
+from utils.metrics import accuracy, nll, brier
 import argparse
 from torchmetrics.functional.classification import calibration_error
-import os
 
 
 jax.config.update('jax_enable_x64', True)
@@ -51,7 +40,6 @@ def main(args):
     subset_of_weights = args.subset  # must be 'all'
     hessian_structure = args.structure  #'full' # other possibility is 'diag' or 'full'
     n_posterior_samples = args.samples
-    security_check = True
     optimize_prior = args.optimize_prior
     print("Are we optimizing the prior? ", optimize_prior)
 
@@ -64,62 +52,17 @@ def main(args):
     torch.manual_seed(seed)
     print("Seed: ", seed)
 
-    shuffle = True
-    # now I have to laod the banana dataset
-    filen = os.path.join("data", "banana", "banana.csv")
-    Xy = np.loadtxt(filen, delimiter=",")
-    Xy = jnp.asarray(Xy)
-    x_train, y_train = Xy[:, :-1], Xy[:, -1]
-    x_test, y_test = Xy[:0, :-1], Xy[:0, -1]
-    y_train, y_test = y_train - 1, y_test - 1
-
-    split_train_size = 0.7
-    strat = None
-    x_full, y_full = jnp.concatenate((x_train, x_test)), jnp.concatenate((y_train, y_test))
-    x_train, x_test, y_train, y_test = sklearn.model_selection.train_test_split(
-        x_full, y_full, train_size=split_train_size, random_state=230, shuffle=shuffle, stratify=strat
-    )
-    x_test, x_valid, y_test, y_valid = sklearn.model_selection.train_test_split(
-        x_test, y_test, train_size=0.5, random_state=230, shuffle=shuffle, stratify=strat
-    )
-
-    x_train = x_train[:265, :]
-    y_train = y_train[:265]
-
-    # define train , valid, test, create data loader for training
-    x_train = x_train.astype(jnp.float32)
-    x_valid = x_valid.astype(jnp.float32)
-    x_test = x_test.astype(jnp.float32)
-    # labels are integers
-    y_train = y_train.astype(jnp.int32)
-    y_valid = y_valid.astype(jnp.int32)
-    y_test = y_test.astype(jnp.int32)
-
-    # Review if there is a more efficient method for this!
-    # Shuffle and batch manually
-    def create_data_loader(x_data, y_data, batch_size, shuffle=True):
-        dataset_size = len(x_data)
-        indices = jnp.arange(dataset_size)
-        
-        if shuffle:
-            indices = jrandom.permutation(rng, dataset_size, independent=True)
-        
-        # Create batches
-        batches = []
-        for i in range(0, dataset_size, batch_size):
-            batch_idx = indices[i:i+batch_size]
-            batches.append((x_data[batch_idx], y_data[batch_idx]))
-        
-        return batches
+    # Load the banana dataset
+    x_train, x_valid, x_test, y_train, y_valid, y_test = load_banana_data()
     
     # Create data loaders
     batch_size_train = 256
     batch_size_valid = 50
     batch_size_test = 50
     
-    train_loader = create_data_loader(x_train, y_train, batch_size=batch_size_train, shuffle=True)
-    valid_loader = create_data_loader(x_valid, y_valid, batch_size=batch_size_valid, shuffle=False)
-    test_loader = create_data_loader(x_test, y_test, batch_size=batch_size_test, shuffle=False)
+    train_loader = create_data_loader(x_train, y_train, batch_size_train, rng, shuffle=True)
+    valid_loader = create_data_loader(x_valid, y_valid, batch_size_valid, rng, shuffle=False)
+    test_loader = create_data_loader(x_test, y_test, batch_size_test, rng, shuffle=False)
     
     if args.optimizer == "sgd":
         learning_rate = 1e-3
@@ -136,61 +79,6 @@ def main(args):
         weight_decay = 1e-3
         optimizer = optax.adamw(learning_rate, weight_decay=weight_decay)
         max_epoch = 1500  
-
-
-    # Define your model using Flax
-    class MLP(nn.Module):
-        num_features: int
-        hidden_size: int
-        num_output: int
-
-        @nn.compact
-        def __call__(self, x):
-            self.sow('intermediates', 'in_0', x)
-            x = nn.Dense(self.hidden_size)(x)
-            x = nn.tanh(x)
-            self.sow('intermediates', 'in_1', x)
-            x = nn.Dense(self.hidden_size)(x)
-            x = nn.tanh(x)
-            self.sow('intermediates', 'in_2', x)
-            x = nn.Dense(self.num_output)(x)
-            return x
-
-
-    # Create training state
-    def create_train_state(rng, model, optimizer):
-        params = model.init(rng, jnp.ones([1, num_features]))  # Dummy input for parameter initialization
-        if optimizer == "sgd":
-            learning_rate = 1e-3
-            weight_decay = 1e-2
-            optimizer = optax.sgd(learning_rate)
-        else:
-            learning_rate = 1e-3
-            weight_decay = 1e-3
-            optimizer = optax.adamw(learning_rate, weight_decay=weight_decay)
-
-        apply_fn = jax.jit(model.apply)
-
-        return train_state.TrainState.create(apply_fn=apply_fn, params=params, tx=optimizer)
-
-        # Loss function
-    @jax.jit
-    def compute_loss(logits, labels):
-        labels = jnp.asarray(labels, dtype=jnp.int32)  # Ensure labels are int32
-        return jnp.sum(optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=labels))
-
-    # Training function
-    @jax.jit
-    def train_step(state, batch_img, batch_label):
-        def loss_fn(params):
-            logits = state.apply_fn(params, batch_img)
-            return compute_loss(logits, batch_label)
-
-        # Compute gradients
-        grad = jax.grad(loss_fn)(state.params)
-        # Update the state with the new parameters
-        new_state = state.apply_gradients(grads=grad)
-        return new_state
 
     num_features = x_train.shape[-1]
     num_output = 2
