@@ -2,20 +2,252 @@
 File containing all the manifold we are going to use for the experiments:
 - Regression manifold
 - Linearized regression manifold
-- cross entropy manifold
-- linearized cross entropy manifold
+- Cross entropy manifold
+- Linearized cross entropy manifold
 """
 
-import torch
-from functorch import grad, jvp, make_functional, vjp, make_functional_with_buffers, hessian, jacfwd, jacrev, vmap
+import jax
+import jax.numpy as jnp
+from jax import grad, jvp
 from functools import partial
-from functorch_utils import get_params_structure, stack_gradient, custum_hvp, stack_gradient2, stack_gradient3
-from torch.distributions import Normal
-from torch import nn
-import numpy as np
-import math
+import flax
+import optax
+from dataclasses import dataclass
+from jax.scipy.special import logsumexp
+import tensorflow as tf
 import time
-import copy
+
+
+class linearized_cross_entropy_manifold:
+    """
+    Also in this case I have to separate data fitting term and regularization term for gradient and
+    hessian computation in case of batches.
+    """
+
+    def __init__(
+        self,
+        model,
+        state_model,
+        X,
+        y,
+        f_MAP,
+        theta_MAP,
+        unravel_fn,
+        batching=False,
+        lambda_reg=None,
+        N=None,
+        B1=None,
+        B2=None,
+    
+    ):
+        self.model = model
+        self.state = state_model
+        self.X = X
+        self.y = y
+        self.N = len(self.X)
+        self.batching = batching
+        self.type = type
+        self.lambda_reg = lambda_reg
+        assert y is None if batching else True, "If batching is True, y should be None"
+
+        self.theta_MAP = theta_MAP
+        self.f_MAP = f_MAP
+        # Initialize model parameters
+        self.params = theta_MAP
+        self.unravel_fn = unravel_fn
+
+        self.N = N
+        self.B1 = B1
+        self.B2 = B2
+        self.factor = 1.0
+
+        if self.B1 is not None:
+            self.factor = N / B1
+            if self.B2 is not None:
+                self.factor = self.factor * (B2 / B1)
+    @staticmethod
+    def is_diagonal():
+        return False
+
+    @partial(jax.jit, static_argnums=(0))
+    def CE_loss(self, param, data, f_MAP):
+        """
+        Data fitting term of the loss
+        """
+
+        def predict(params, datas):
+            y_preds = self.state.apply_fn(params, datas)
+            return y_preds
+
+        x, y = data
+
+        params_map = self.unravel_fn(self.theta_MAP)
+        diff_weights = jax.tree_util.tree_map(lambda p, m: (p - m).astype(m.dtype), param, self.params_map)
+        _, jvp_value = jvp(predict, (params_map, x), (diff_weights, jnp.zeros_like(x)))
+
+        y_pred = f_MAP + jvp_value
+        
+        def criterion(predictions, targets):
+            # Apply softmax to predictions to get probabilities
+            probs = jax.nn.softmax(predictions, axis=-1)
+            
+            # Use log of probabilities to get log-probabilities
+            log_probs = jnp.log(probs)
+            
+            # Use targets as indices (not one-hot encoded)
+            return jnp.sum(-jnp.take_along_axis(log_probs, targets[:, None], axis=-1))  # Use targets as indices
+        
+        return self.factor * criterion(y_pred, y)
+
+
+    def L2_norm(self, param):
+        """
+        L2 regularization. I need this separate from the loss for the gradient computation.
+        """
+        # Sum squared values of the parameters
+        w_norm = sum(jnp.sum(w ** 2) for w in jax.tree_util.tree_leaves(param['params']))
+        return self.lambda_reg * w_norm
+
+    @partial(jax.jit, static_argnums=(0))
+    def compute_grad_data_fitting_term(self, params, data, f_MAP):
+        ft_compute_grad = grad(self.CE_loss)
+
+        ft_per_sample_grads = ft_compute_grad(params, data, f_MAP)
+        return ft_per_sample_grads
+
+    @partial(jax.jit, static_argnums=(0))
+    def compute_grad_L2_reg(self, params):
+        ft_compute_grad = grad(self.L2_norm)
+        ft_per_sample_grads = ft_compute_grad(params)
+        return ft_per_sample_grads
+    
+    def compute_kfac_hvp(self, intermediates, ft_compute_grad, vel_as_params, num_layers=3):
+        kfac_factors = {}
+
+        for i in range(num_layers):
+            layer_name = f'Dense_{i}'
+
+            # Extract activations for the current layer
+            activation = intermediates['intermediates'][f'in_{i}'][0]  # Shape: (batch_size, layer_dim)
+            # Compute A (Activation covariance)
+            A = jnp.matmul(activation.T, activation) / activation.shape[0]  # Shape: (layer_dim, layer_dim)
+
+            # Extract gradients for the current layer
+            grad = ft_compute_grad['params'][layer_name]['kernel']  # Shape: (input_dim, output_dim)
+            # Reshape gradients if necessary
+            grad = grad.reshape(-1, grad.shape[-1])  # Ensure it's 2D
+            # Compute G (Gradient covariance)
+            G = jnp.matmul(grad.T, grad) / grad.shape[0]  # Shape: (output_dim, output_dim)
+
+            kfac_factors[layer_name] = (G, A)
+
+            # Bias factors
+            grad_bias = ft_compute_grad['params'][layer_name]['bias']  # Shape: (output_dim,)
+            G_bias = jnp.outer(grad_bias, grad_bias) / grad_bias.shape[0]  # Shape: (output_dim, output_dim)
+            A_bias = jnp.ones((1, 1))  # Since bias activations are 1
+
+            kfac_factors[f'{layer_name}_bias'] = (G_bias, A_bias)
+
+        # Compute Hessian-vector product using K-FAC approximation
+        hvp_list = []
+        for i in range(num_layers):
+            layer_name = f'Dense_{i}'
+
+            # Extract Kronecker factors
+            G, A = kfac_factors[layer_name]
+            G_bias, A_bias = kfac_factors[f'{layer_name}_bias']
+
+            # Extract velocities for current layer
+            v = vel_as_params['params'][layer_name]['kernel']
+            v_bias = vel_as_params['params'][layer_name]['bias']
+
+            # Compute HVP for weights
+            v_out = jnp.matmul(A, jnp.matmul(G, v.T))
+            hvp_list.append(v_out.flatten())
+
+            # Compute HVP for biases
+            v_bias_out = G_bias @ v_bias  # Since A_bias is scalar 1, can omit
+            hvp_list.append(v_bias_out.flatten())
+
+        return jnp.concatenate(hvp_list)
+
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def geodesic_system(self, current_point, velocity, return_hvp=False):
+
+        if isinstance(self.X, tf.data.Dataset):
+            batchify = True
+        else:
+            batchify = False
+            data = (self.X, self.y)
+
+        # let's start by putting the current points into the model
+        state = self.state.replace(params = self.unravel_fn(current_point))
+
+        # now I have everything to compute the the second derivative
+        # let's compute the gradient
+        start = time.time()
+        grad_data_fitting_term = 0
+        if batchify:
+            params = self.unravel_fn(current_point)
+            self.params_map = self.unravel_fn(self.theta_MAP)
+
+            for batch_img, batch_label, batch_MAP in self.X:
+                grad_per_example = jax.flatten_util.ravel_pytree(self.compute_grad_data_fitting_term(params, (batch_img, batch_label), batch_MAP))[0]
+                grad_data_fitting_term += grad_per_example.reshape(-1, 1)
+        else:
+            params = self.unravel_fn(current_point)
+            self.params_map = self.unravel_fn(self.theta_MAP)
+            
+            # grad_per_example = jax.flatten_util.ravel_pytree(self.compute_grad_data_fitting_term(params, data, self.f_MAP))[0]
+            # grad_data_fitting_term = grad_per_example.reshape(-1, 1)
+            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
+            
+        end = time.time()
+
+        # here now I have to compute also the gradient of the regularization term
+        # Compute gradient of the regularization term
+        if self.lambda_reg is not None:
+            grad_reg = self.compute_grad_L2_reg(params)
+        else:
+            grad_reg = None
+
+        # Combine gradients
+        tot_gradient = grad_data_fitting_term
+        if grad_reg is not None:
+            tot_gradient = jax.tree_util.tree_map(lambda x, y: x + y, tot_gradient, grad_reg)
+
+        tot_gradient = jax.flatten_util.ravel_pytree(tot_gradient)[0]
+
+        vel_as_params = self.unravel_fn(velocity)
+
+        start = time.time()
+        hvp_data_fitting = 0
+        if batchify:
+            for batch_img, batch_label, batch_f_MAP in self.X:
+                _, intermediates = self.model.apply(state.params, batch_img, mutable=['intermediates'])
+                hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
+        else:
+            _, intermediates = self.model.apply(state.params, data[0], mutable=['intermediates'])
+            hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
+
+        # I have to add the hvp of the regularization term
+        if self.lambda_reg is not None:
+            hvp_reg = 2 * self.lambda_reg * velocity
+
+            tot_hvp = hvp_data_fitting + hvp_reg.reshape(-1)
+        else:
+            tot_hvp = hvp_data_fitting
+        end = time.time()
+
+        second_derivative = -((tot_gradient / (1 + tot_gradient.T @ tot_gradient)) * (velocity.T @ tot_hvp)).flatten()
+
+        if return_hvp:
+            return second_derivative.reshape(-1, 1), tot_hvp.reshape(-1, 1)
+        else:
+            return second_derivative.reshape(-1, 1)
+        
+
 
 class cross_entropy_manifold:
     """
@@ -25,31 +257,34 @@ class cross_entropy_manifold:
     """
 
     def __init__(
-        self, model, X, y, batching=False, device="cpu", lambda_reg=None, type="fc", N=None, B1=None, B2=None
+        self, 
+        state_model, 
+        X, 
+        y,
+        unravel_fn, 
+        batching=False, 
+        lambda_reg=None, 
+        N=None, 
+        B1=None, 
+        B2=None
     ):
-        self.model = model
-
+        self.state = state_model
         self.X = X
         self.y = y
         self.N = len(self.X)
-        self.n_params = len(torch.nn.utils.parameters_to_vector(self.model.parameters()))
         self.batching = batching
-        self.device = device
         self.type = type
-        # self.prior_precision = prior_precision
         self.lambda_reg = lambda_reg
         assert y is None if batching else True, "If batching is True, y should be None"
 
-        # these are just to avoid to have to pass them as input of the functions
-        # we use to compute the gradient and the hessian vector product
-        self.fmodel = None
-        self.buffers = None
+        self.unravel_fn = unravel_fn
 
-        ## stuff we need when using barches
+
+        ## stuff we need when using batches
         self.N = N
         self.B1 = B1
         self.B2 = B2
-        self.factor = None
+        self.factor = 1.0
 
         # here I can already compute the factor_loss
         if self.B1 is not None:
@@ -60,553 +295,126 @@ class cross_entropy_manifold:
     @staticmethod
     def is_diagonal():
         return False
-    
-    def register_hooks(self, model):
-        activations = {}
 
-        def save_activation(name):
-            def hook(module, input, output):
-                activations[name] = input[0]
-            return hook
-
-        # Register hooks only for Linear layers
-        for name, layer in model.named_modules():
-            if isinstance(layer, nn.Linear):  # Only register hooks for Linear layers
-                layer.register_forward_hook(save_activation(name))
-    
-        return activations
-
-    def compute_gradients(self, model, input, target, criterion):
-        model.zero_grad()
-        output = model(input)
-        loss = self.CE_loss(list(model.parameters()), (input, target), self.f_MAP) 
-        loss.backward()
-        
-        # Extract only gradients for weights (exclude biases)
-        gradients = {name: param.grad for name, param in model.named_parameters()}
-        
-        return gradients, loss
-    
-    def compute_kfac_approximation(self, gradients, activations):
-        """Compute Kronecker factors for each layer, including biases."""
-        kfac_factors = {}
-        
-        for layer_name, grad in gradients.items():
-            act_name = layer_name  # Bias or weight layer should have the same name
-            
-            # Check if the layer is a weight or a bias
-            if "weight" in layer_name:
-                activation = activations[layer_name.split('.')[0]]  # Fetch the corresponding activation for weights
-                # Compute Kronecker factors for weights
-                G = torch.matmul(grad.t(), grad) / activation.shape[0]  # Gradient outer product (approximation)
-                A = torch.matmul(activation.t(), activation) / activation.shape[0]  # Activation outer product (approximation)
-
-                kfac_factors[layer_name] = (G, A)
-                
-                # Now add the corresponding bias
-                bias_name = layer_name.replace('weight', 'bias')
-                bias_grad = gradients[bias_name]
-                
-                # Reshape bias gradient to be a column vector of shape [16, 1]
-                G_bias = bias_grad
-                
-                # Bias activation is just a vector of ones (shape [N, 1])
-                A_bias = torch.ones(bias_grad.shape[0])  # Bias activation is a vector of ones
-                kfac_factors[bias_name] = (G_bias, A_bias)
-        
-        return kfac_factors
-    
-    def compute_kfac_vector_product(self, kfac_factors, velocity):
-        """Compute the KFAC approximation of the Hessian-vector product with L2 regularization and biases."""
-        hvp_list = []
-        
-        for layer_name, (G, A) in kfac_factors.items():
-            if "bias" in layer_name:
-                # Handle bias separately: We assume bias gradients are scalar, so A is a scalar.
-                v = velocity[layer_name].view(-1)  # Bias velocity is a vector (since it's scalar)
-                v_out = G * v  # For bias, no matrix multiplication, just scaling by A (which is 1)
-            else:
-                # Reshape velocity to match layer dimensions for weight layers
-                v = velocity[layer_name].view(A.shape[1], -1)  # Reshape to match the layer dimensions
-                
-                # Perform KFAC HVP for weights
-                v_out = torch.matmul(A, torch.matmul(G, v))
-            
-            
-            # Flatten and store
-            hvp_list.append(v_out.view(-1))
-        
-        # Concatenate all layer results into a single vector
-        return torch.cat(hvp_list)
-
-
+    @partial(jax.jit, static_argnums=(0))
     def CE_loss(self, param, data):
         """
         Data fitting term of the loss
         """
         x, y = data
-        x = x.to(self.device)
-        y = y.to(self.device)
+        y_pred = self.state.apply_fn(param, x)
 
-        if self.type != "fc":
-            # assuming input for con
-            x = x.unsqueeze(1)
+        def criterion(predictions, targets):
+            # Apply softmax to predictions to get probabilities
+            probs = jax.nn.softmax(predictions, axis=-1)
+            
+            # Use log of probabilities to get log-probabilities
+            log_probs = jnp.log(probs)
+            
+            # Use targets as indices (not one-hot encoded)
+            return jnp.sum(-jnp.take_along_axis(log_probs, targets[:, None], axis=-1))  # Use targets as indices
 
-        if self.model is None:
-            raise NotImplementedError("Compute usual prediction still have to be implemented")
-        else:
-            # self.fmodel.eval()
-            y_pred = self.fmodel(param, self.buffers, x)
+        return self.factor * criterion(y_pred, y)
 
-        criterion = torch.nn.CrossEntropyLoss(reduction="sum")
 
-        if self.type == "fc":
-            if self.factor is not None:
-                return self.factor * criterion(y_pred, y)
-            else:
-                return criterion(y_pred, y)
-        else:
-            if self.factor is not None:
-                return self.factor * criterion(y_pred.view(-1), y)
-            else:
-                return criterion(y_pred.view(-1), y)
 
     def L2_norm(self, param):
         """
-        L2 regularization. I need this separate from the loss for the gradient computation
+        L2 regularization. I need this separate from the loss for the gradient computation.
         """
-        w_norm = sum([sum(w.view(-1) ** 2) for w in param])
+        # Sum squared values of the parameters
+        w_norm = sum(jnp.sum(w ** 2) for w in jax.tree_util.tree_leaves(param['params']))
         return self.lambda_reg * w_norm
 
+    @partial(jax.jit, static_argnums=(0))
     def compute_grad_data_fitting_term(self, params, data):
-        # TODO: understand how to make vmap work without passing the data
         ft_compute_grad = grad(self.CE_loss)
-        # ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0))
-        # the input of this function is just the parameters, because
-        # we are accessing the data from the class
-        ft_per_sample_grads = ft_compute_grad(params, data)
-        return ft_per_sample_grads
 
+        ft_per_sample_grads = ft_compute_grad(params, data)
+        return jax.flatten_util.ravel_pytree(ft_per_sample_grads)[0]
+
+    @partial(jax.jit, static_argnums=(0))
     def compute_grad_L2_reg(self, params):
         ft_compute_grad = grad(self.L2_norm)
-
         ft_per_sample_grads = ft_compute_grad(params)
-        return ft_per_sample_grads
-
+        return jax.flatten_util.ravel_pytree(ft_per_sample_grads)[0]
+    
+    @partial(jax.jit, static_argnums=(0, 1))
+    def custom_hvp(self, f, primals, tangents):
+        grad_f = grad(f)
+        return jax.jvp(grad_f, primals, tangents)
+    
+    @partial(jax.jit, static_argnums=(0,))
     def geodesic_system(self, current_point, velocity, return_hvp=False):
-        # check if they are numpy array or torch.Tensor
-        # here we need torch tensor to perform these operations
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float().to(self.device)
-
-        if not isinstance(velocity, torch.Tensor):
-            velocity = torch.from_numpy(velocity).float().to(self.device)
-
-        # I would expect both current point and velocity to be
-        # two vectors of shape n_params
-        if isinstance(self.X, torch.utils.data.DataLoader):
+        if isinstance(self.X, tf.data.Dataset):
             batchify = True
         else:
             batchify = False
             data = (self.X, self.y)
 
         # let's start by putting the current points into the model
-        torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-
-        self.model.zero_grad()
-
-        self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-        # and I have to reshape the velocity into being the same structure as the params
-        vel_as_params = get_params_structure(velocity, params)
+        state = self.state.replace(params = self.unravel_fn(current_point))
 
         # now I have everything to compute the the second derivative
         # let's compute the gradient
         start = time.time()
         grad_data_fitting_term = 0
         if batchify:
+            params = self.unravel_fn(current_point)
             for batch_img, batch_label in self.X:
                 grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label))
-                grad_data_fitting_term += stack_gradient3(grad_per_example, self.n_params).view(-1, 1)
+                grad_data_fitting_term += grad_per_example.reshape(-1, 1)
         else:
+            params = self.unravel_fn(current_point)
             grad_per_example = self.compute_grad_data_fitting_term(params, data)
-            gradw = stack_gradient3(grad_per_example, self.n_params)
-            grad_data_fitting_term = gradw.view(-1, 1)
-        end = time.time()
-
-        # now I have to compute the gradient of the regularization term
-        if self.lambda_reg is not None:
-            # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
-        else:
-            grad_reg = 0
-
-        tot_gradient = grad_data_fitting_term + grad_reg
-
-        # Register hooks to capture activations from linear layers
-        activations = self.register_hooks(self.model)
-
-
-        vel_as_params = get_params_structure(velocity, params)
-        pointer = 0
-        velocity_reconstructed = {}
-
-        for name, param in self.model.named_parameters():
-            num_param = param.numel()  # Number of elements in the parameter tensor
-            velocity_reconstructed[name] = velocity[pointer:pointer + num_param].view(param.shape)
-            pointer += num_param
-
-
-        # now I have also to compute the Hvp between hessian and velocity
-        start = time.time()
-        if batchify:
-            hvp_data_fitting = 0
-            for batch_img, batch_label in self.X:
-                if self.type == "fc":
-                    # Compute Gradients (and loss)
-                    gradients, _ = self.compute_gradients(self.model, batch_img, batch_label, nn.CrossEntropyLoss(reduction = 'sum'))
-                    kfac_factors = self.compute_kfac_approximation(gradients, activations)
-                    # Compute HVP with KFAC
-                    hvp_kfac = self.compute_kfac_vector_product(kfac_factors, velocity_reconstructed)
-                else:
-                    print("If you are getting an error, before here I was using self.CE_loss2, so double check that")
-                    # Compute Gradients (and loss)
-                    gradients, _ = self.compute_gradients(self.model, batch_img, batch_label, nn.CrossEntropyLoss(reduction = 'sum'))
-                    kfac_factors = self.compute_kfac_approximation(gradients, activations)
-                    # Compute HVP with KFAC
-                    hvp_kfac = self.compute_kfac_vector_product(kfac_factors, velocity_reconstructed)
-        else:
-            # Compute Gradients (and loss)
-            gradients, _ = self.compute_gradients(self.model, data[0], data[1], nn.CrossEntropyLoss(reduction = 'sum'))
-            kfac_factors = self.compute_kfac_approximation(gradients, activations)
-            # Compute HVP with KFAC
-            hvp_kfac = self.compute_kfac_vector_product(kfac_factors, velocity_reconstructed)
-
-
-        if self.lambda_reg is not None:
-            hvp_reg = 2 * self.lambda_reg * velocity
-            tot_hvp = hvp_kfac + hvp_reg.view(-1)
-        else:
-            tot_hvp = hvp_kfac
-
-        tot_hvp = tot_hvp.to(self.device)
-        tot_gradient = tot_gradient.to(self.device)
-        end = time.time()
-
-        second_derivative = -((tot_gradient / (1 + tot_gradient.T @ tot_gradient)) * (velocity.T @ tot_hvp)).flatten()
-
-        if return_hvp:
-            return second_derivative.view(-1, 1).detach().cpu().numpy(), tot_hvp.view(-1, 1).detach().cpu().numpy()
-        else:
-            return second_derivative.view(-1, 1).detach().cpu().numpy()
-
-### Check what parameters to pass to the new hvp!!
-class linearized_cross_entropy_manifold:
-    """
-    Also in this case I have to separate data fitting term and regularization term for gradient and
-    hessian computation in case of batches.
-    """
-
-    def __init__(
-        self,
-        model,
-        X,
-        y,
-        f_MAP,
-        theta_MAP,
-        batching=False,
-        device="cpu",
-        lambda_reg=None,
-        type="fc",
-        N=None,
-        B1=None,
-        B2=None,
-    ):
-        self.model = model
-        # TODO: decide if it is better to pass X and Y or
-        # pass data that is either data = (X,y) or a dataloader
-        self.X = X
-        self.y = y
-        self.N = len(self.X)
-        self.n_params = len(torch.nn.utils.parameters_to_vector(self.model.parameters()))
-        self.batching = batching
-        self.device = device
-        self.type = type
-        # self.prior_precision = prior_precision
-        self.lambda_reg = lambda_reg
-        assert y is None if batching else True, "If batching is True, y should be None"
-
-        self.theta_MAP = theta_MAP
-        self.f_MAP = f_MAP
-
-        # these are just to avoid to have to pass them as input of the functions
-        # we use to compute the gradient and the hessian vector product
-        self.fmodel = None
-        self.buffers = None
-
-        self.fmodel_map = None
-        self.params_map = None
-        self.buffers_map = None
-
-        self.N = N
-        self.B1 = B1
-        self.B2 = B2
-        self.factor = None
-
-        if self.B1 is not None:
-            self.factor = N / B1
-            if self.B2 is not None:
-                self.factor = self.factor * (B2 / B1)
-
-    @staticmethod
-    def is_diagonal():
-        return False
-     
-    def register_hooks(self, model):
-        activations = {}
-
-        def save_activation(name):
-            def hook(module, input, output):
-                activations[name] = input[0]
-            return hook
-
-        # Register hooks only for Linear layers
-        for name, layer in model.named_modules():
-            if isinstance(layer, nn.Linear):  # Only register hooks for Linear layers
-                layer.register_forward_hook(save_activation(name))
-    
-        return activations
-
-    # Function to compute gradients (weights only)
-    def compute_gradients(self, model, input, target, criterion):
-        model.zero_grad()
-        output = model(input)
-        loss = self.CE_loss(list(model.parameters()), (input, target), self.f_MAP) 
-        loss.backward()
-        
-        # Extract only gradients for weights (exclude biases)
-        gradients = {name: param.grad for name, param in model.named_parameters()}
-        
-        return gradients, loss
-    
-    def compute_kfac_approximation(self, gradients, activations):
-        """Compute Kronecker factors for each layer, including biases."""
-        kfac_factors = {}
-        
-        for layer_name, grad in gradients.items():
-            act_name = layer_name  # Bias or weight layer should have the same name
-            
-            # Check if the layer is a weight or a bias
-            if "weight" in layer_name:
-                activation = activations[layer_name.split('.')[0]]  # Fetch the corresponding activation for weights
-                # Compute Kronecker factors for weights
-                G = torch.matmul(grad.t(), grad) / activation.shape[0]  # Gradient outer product (approximation)
-                A = torch.matmul(activation.t(), activation) / activation.shape[0]  # Activation outer product (approximation)
-
-                kfac_factors[layer_name] = (G, A)
-                
-                # Now add the corresponding bias
-                bias_name = layer_name.replace('weight', 'bias')
-                bias_grad = gradients[bias_name]
-                
-                # Reshape bias gradient to be a column vector of shape [16, 1]
-                G_bias = bias_grad
-                
-                # Bias activation is just a vector of ones (shape [N, 1])
-                A_bias = torch.ones(bias_grad.shape[0])  # Bias activation is a vector of ones
-                kfac_factors[bias_name] = (G_bias, A_bias)
-        
-        return kfac_factors
-    
-    def compute_kfac_vector_product(self, kfac_factors, velocity):
-        """Compute the KFAC approximation of the Hessian-vector product with L2 regularization and biases."""
-        hvp_list = []
-        
-        for layer_name, (G, A) in kfac_factors.items():
-            if "bias" in layer_name:
-                # Handle bias separately: We assume bias gradients are scalar, so A is a scalar.
-                v = velocity[layer_name].view(-1)  # Bias velocity is a vector (since it's scalar)
-                v_out = G * v  # For bias, no matrix multiplication, just scaling by A (which is 1)
-            else:
-                # Reshape velocity to match layer dimensions for weight layers
-                v = velocity[layer_name].view(A.shape[1], -1)  # Reshape to match the layer dimensions
-                
-                # Perform KFAC HVP for weights
-                v_out = torch.matmul(A, torch.matmul(G, v))
-            
-            
-            # Flatten and store
-            hvp_list.append(v_out.view(-1))
-        
-        # Concatenate all layer results into a single vector
-        return torch.cat(hvp_list)
-
-    def CE_loss(self, param, data, f_MAP):
-        """
-        Data fitting term of the loss
-        """
-
-        def predict(params, datas):
-            y_preds = self.fmodel_map(params, self.buffers_map, datas)
-            return y_preds
-
-        x, y = data
-        x = x.to(self.device)
-        y = y.to(self.device)
-
-        if self.type != "fc":
-            x = x.unsqueeze(1)
-
-        params_map = get_params_structure(self.theta_MAP, param)
-        diff_weights = []
-        for i in range(len(param)):
-            diff_weights.append(param[i] - self.params_map[i])
-        diff_weights = tuple(diff_weights)
-        _, jvp_value = jvp(predict, (params_map, x), (diff_weights, torch.zeros_like(x)), strict=False)
-
-        y_pred = f_MAP + jvp_value
-
-        criterion = torch.nn.CrossEntropyLoss(reduction="sum")
-
-        if self.type == "fc":
-            if self.factor is not None:
-                return self.factor * criterion(y_pred, y)
-            else:
-                return criterion(y_pred, y)
-        else:
-            if self.factor is not None:
-                return self.factor * criterion(y_pred.view(-1), y)
-            else:
-                return criterion(y_pred.view(-1), y)
-
-    def L2_norm(self, param):
-        """
-        L2 regularization. I need this separate from the loss for the gradient computation
-        """
-        w_norm = sum([sum(w.view(-1) ** 2) for w in param])
-        return self.lambda_reg * w_norm
-
-    def compute_grad_data_fitting_term(self, params, data, f_MAP):
-        ft_compute_grad = grad(self.CE_loss)
-        ft_per_sample_grads = ft_compute_grad(params, data, f_MAP)
-        return ft_per_sample_grads
-
-    def compute_grad_L2_reg(self, params):
-        ft_compute_grad = grad(self.L2_norm)
-        ft_per_sample_grads = ft_compute_grad(params)
-        return ft_per_sample_grads
-
-    def geodesic_system(self, current_point, velocity, return_hvp=False):
-        # check if they are numpy array or torch.Tensor
-        # here we need torch tensor to perform these operations
-        if not isinstance(current_point, torch.Tensor):
-            current_point = torch.from_numpy(current_point).float().to(self.device)
-
-        if not isinstance(velocity, torch.Tensor):
-            velocity = torch.from_numpy(velocity).float().to(self.device)
-
-        if isinstance(self.X, torch.utils.data.DataLoader):
-            batchify = True
-        else:
-            batchify = False
-            data = (self.X, self.y)
-
-        # let's start by putting the current points into the model
-        torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-
-        # now I have everything to compute the the second derivative
-        # let's compute the gradient
-        start = time.time()
-        grad_data_fitting_term = 0
-        if batchify:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            for batch_img, batch_label, batch_MAP in self.X:
-                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label), batch_MAP)
-                grad_data_fitting_term += stack_gradient3(grad_per_example, self.n_params).view(-1, 1)
-        else:
-            self.model.zero_grad()
-            torch.nn.utils.vector_to_parameters(current_point, self.model.parameters())
-            self.fmodel, params, self.buffers = make_functional_with_buffers(self.model)
-
-            torch.nn.utils.vector_to_parameters(self.theta_MAP, self.model.parameters())
-            self.fmodel_map, self.params_map, self.buffers_map = make_functional_with_buffers(self.model)
-
-            grad_per_example = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
-            gradw = stack_gradient3(grad_per_example, self.n_params)
-            grad_data_fitting_term = gradw.view(-1, 1)
+            grad_data_fitting_term = grad_per_example.reshape(-1, 1)
         end = time.time()
 
         # here now I have to compute also the gradient of the regularization term
         if self.lambda_reg is not None:
             # I have to compute the L2 reg gradient
             grad_reg = self.compute_grad_L2_reg(params)
-            grad_reg = stack_gradient3(grad_reg, self.n_params)
-            grad_reg = grad_reg.view(-1, 1)
+            grad_reg = grad_reg.reshape(-1, 1)
 
         else:
             grad_reg = 0
 
         tot_gradient = grad_data_fitting_term + grad_reg
 
-        # Register hooks to capture activations from linear layers
-        activations = self.register_hooks(self.model)
+        # and I have to reshape the velocity into being the same structure as the params
+        vel_as_params = self.unravel_fn(velocity)
 
-
-        vel_as_params = get_params_structure(velocity, params)
-        pointer = 0
-        velocity_reconstructed = {}
-
-        for name, param in self.model.named_parameters():
-            num_param = param.numel()  # Number of elements in the parameter tensor
-            velocity_reconstructed[name] = velocity[pointer:pointer + num_param].view(param.shape)
-            pointer += num_param
-
+        # now I have also to compute the Hvp between hessian and velocity
         start = time.time()
         hvp_data_fitting = 0
         if batchify:
-            for batch_img, batch_label, batch_f_MAP in self.X:
-                if self.type == "fc":
-                    # Compute Gradients (and loss)
-                    gradients, _ = self.compute_gradients(self.model, batch_img, batch_label, nn.CrossEntropyLoss(reduction = 'sum'))
-                    kfac_factors = self.compute_kfac_approximation(gradients, activations)
-                    # Compute HVP with KFAC
-                    hvp_kfac = self.compute_kfac_vector_product(kfac_factors, velocity_reconstructed)
-                else:
-                    # Compute Gradients (and loss)
-                    gradients, _ = self.compute_gradients(self.model, batch_img, batch_label, nn.CrossEntropyLoss(reduction = 'sum'))
-                    kfac_factors = self.compute_kfac_approximation(gradients, activations)
-                    # Compute HVP with KFAC
-                    hvp_kfac = self.compute_kfac_vector_product(kfac_factors, velocity_reconstructed)
-        else:
-                    # Compute Gradients (and loss)
-            gradients, _ = self.compute_gradients(self.model, data[0], data[1], nn.CrossEntropyLoss(reduction = 'sum'))
-            kfac_factors = self.compute_kfac_approximation(gradients, activations)
-            # Compute HVP with KFAC
-            hvp_kfac = self.compute_kfac_vector_product(kfac_factors, velocity_reconstructed)
+            for batch_img, batch_label in self.X:
+                _, result = self.custom_hvp(
+                    self.CE_loss,
+                    (params, (batch_img, batch_label)),
+                    (vel_as_params, (jnp.zeros_like(batch_img), jnp.zeros_like(batch_label))),
+                )
+            
+            hvp_data_fitting += jax.flatten_util.ravel_pytree(result)[0]
 
-        # I have to add the hvp of the regularization term
+        else:
+            _, result = self.custom_hvp(
+                self.CE_loss, (params, data), (vel_as_params, (jnp.zeros_like(data[0]), jnp.zeros(data[1].shape, dtype=jax.dtypes.float0)))
+            )
+        
+            hvp_data_fitting += jax.flatten_util.ravel_pytree(result)[0]
+
+
         if self.lambda_reg is not None:
             hvp_reg = 2 * self.lambda_reg * velocity
-
-            tot_hvp = hvp_kfac + hvp_reg.view(-1)
+            tot_hvp = hvp_data_fitting + hvp_reg.reshape(-1)
         else:
-            tot_hvp = hvp_kfac
-
-        tot_hvp = tot_hvp.to(self.device)
-        tot_gradient = tot_gradient.to(self.device)
+            tot_hvp = hvp_data_fitting
         end = time.time()
 
         second_derivative = -((tot_gradient / (1 + tot_gradient.T @ tot_gradient)) * (velocity.T @ tot_hvp)).flatten()
 
         if return_hvp:
-            return second_derivative.view(-1, 1).detach().cpu().numpy(), tot_hvp.view(-1, 1).detach().cpu().numpy()
+            return second_derivative.reshape(-1, 1), tot_hvp.view(-1, 1)
         else:
-            return second_derivative.view(-1, 1).detach().cpu().numpy()
+            return second_derivative.reshape(-1, 1)

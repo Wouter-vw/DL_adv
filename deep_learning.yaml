@@ -169,7 +169,6 @@ dependencies:
       - fsspec==2024.10.0
       - gast==0.6.0
       - google-pasta==0.2.0
-      - gpytorch==1.13
       - grpcio==1.67.1
       - h5py==3.12.1
       - humanize==4.11.0
@@ -186,7 +185,6 @@ dependencies:
       - laplace-torch==0.2.1
       - libclang==18.1.1
       - lightning-utilities==0.11.8
-      - linear-operator==0.5.3
       - lineax==0.0.7
       - markdown==3.7
       - markdown-it-py==3.0.0
