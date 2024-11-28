@@ -37,6 +37,7 @@ class linearized_cross_entropy_manifold:
         # Initialize model parameters
         self.params = theta_MAP
         self.unravel_fn = unravel_fn
+        self.factor = 1.0
 
     @partial(jax.jit, static_argnums=(0))
     def CE_loss(self, param, data, f_MAP):
@@ -138,32 +139,17 @@ class linearized_cross_entropy_manifold:
     @partial(jax.jit, static_argnums=(0,))
     def geodesic_system(self, current_point, velocity, return_hvp=False):
 
-        if isinstance(self.X, tf.data.Dataset):
-            batchify = True
-        else:
-            batchify = False
-            data = (self.X, self.y)
+        data = (self.X, self.y)
 
         # let's start by putting the current points into the model
         state = self.state.replace(params = self.unravel_fn(current_point))
 
         # now I have everything to compute the the second derivative
         # let's compute the gradient
-        start = time.time()
         grad_data_fitting_term = 0
-        if batchify:
-            params = self.unravel_fn(current_point)
-            self.params_map = self.unravel_fn(self.theta_MAP)
-
-            for batch_img, batch_label, batch_MAP in self.X:
-                grad_per_example = jax.flatten_util.ravel_pytree(self.compute_grad_data_fitting_term(params, (batch_img, batch_label), batch_MAP))[0]
-                grad_data_fitting_term += grad_per_example.reshape(-1, 1)
-        else:
-            params = self.unravel_fn(current_point)
-            self.params_map = self.unravel_fn(self.theta_MAP)            
-            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
-            
-        end = time.time()
+        params = self.unravel_fn(current_point)
+        self.params_map = self.unravel_fn(self.theta_MAP)            
+        grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
 
         # here now I have to compute also the gradient of the regularization term
         # Compute gradient of the regularization term
@@ -183,13 +169,8 @@ class linearized_cross_entropy_manifold:
 
         start = time.time()
         hvp_data_fitting = 0
-        if batchify:
-            for batch_img, batch_label, batch_f_MAP in self.X:
-                _, intermediates = self.model.apply(state.params, batch_img, mutable=['intermediates'])
-                hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
-        else:
-            _, intermediates = self.model.apply(state.params, data[0], mutable=['intermediates'])
-            hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
+        _, intermediates = self.model.apply(state.params, data[0], mutable=['intermediates'])
+        hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
 
         # I have to add the hvp of the regularization term
         if self.lambda_reg is not None:
@@ -235,6 +216,7 @@ class cross_entropy_manifold:
         self.type = type
         self.lambda_reg = lambda_reg
         self.unravel_fn = unravel_fn
+        self.factor = 1.0
 
     @partial(jax.jit, static_argnums=(0))
     def CE_loss(self, param, data):
@@ -324,28 +306,17 @@ class cross_entropy_manifold:
   
     @partial(jax.jit, static_argnums=(0,))
     def geodesic_system(self, current_point, velocity, return_hvp=False):
-        if isinstance(self.X, tf.data.Dataset):
-            batchify = True
-        else:
-            batchify = False
-            data = (self.X, self.y)
+
+        data = (self.X, self.y)
 
         # let's start by putting the current points into the model
         state = self.state.replace(params = self.unravel_fn(current_point))
 
         # now I have everything to compute the the second derivative
         # let's compute the gradient
-        start = time.time()
         grad_data_fitting_term = 0
-        if batchify:
-            params = self.unravel_fn(current_point)
-            for batch_img, batch_label in self.X:
-                grad_per_example = self.compute_grad_data_fitting_term(params, (batch_img, batch_label))
-                grad_data_fitting_term += grad_per_example.reshape(-1, 1)
-        else:
-            params = self.unravel_fn(current_point)
-            grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data)
-        end = time.time()
+        params = self.unravel_fn(current_point)
+        grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data)
 
         # here now I have to compute also the gradient of the regularization term
         if self.lambda_reg is not None:
@@ -366,13 +337,8 @@ class cross_entropy_manifold:
         # now I have also to compute the Hvp between hessian and velocity
         start = time.time()
         hvp_data_fitting = 0
-        if batchify:
-            for batch_img, batch_label, batch_f_MAP in self.X:
-                _, intermediates = self.model.apply(state.params, batch_img, mutable=['intermediates'])
-                hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
-        else:
-            _, intermediates = self.model.apply(state.params, data[0], mutable=['intermediates'])
-            hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
+        _, intermediates = self.model.apply(state.params, data[0], mutable=['intermediates'])
+        hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
 
         # I have to add the hvp of the regularization term
         if self.lambda_reg is not None:
