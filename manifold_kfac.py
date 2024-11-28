@@ -23,10 +23,6 @@ class linearized_cross_entropy_manifold:
         unravel_fn,
         batching=False,
         lambda_reg=None,
-        N=None,
-        B1=None,
-        B2=None,
-    
     ):
         self.model = model
         self.state = state_model
@@ -36,23 +32,11 @@ class linearized_cross_entropy_manifold:
         self.batching = batching
         self.type = type
         self.lambda_reg = lambda_reg
-        assert y is None if batching else True, "If batching is True, y should be None"
-
         self.theta_MAP = theta_MAP
         self.f_MAP = f_MAP
         # Initialize model parameters
         self.params = theta_MAP
         self.unravel_fn = unravel_fn
-
-        self.N = N
-        self.B1 = B1
-        self.B2 = B2
-        self.factor = 1.0
-
-        if self.B1 is not None:
-            self.factor = N / B1
-            if self.B2 is not None:
-                self.factor = self.factor * (B2 / B1)
 
     @partial(jax.jit, static_argnums=(0))
     def CE_loss(self, param, data, f_MAP):
@@ -240,10 +224,7 @@ class cross_entropy_manifold:
         y,
         unravel_fn, 
         batching=False, 
-        lambda_reg=None, 
-        N=None, 
-        B1=None, 
-        B2=None
+        lambda_reg=None
     ):
         self.model = model
         self.state = state_model
@@ -253,22 +234,7 @@ class cross_entropy_manifold:
         self.batching = batching
         self.type = type
         self.lambda_reg = lambda_reg
-        assert y is None if batching else True, "If batching is True, y should be None"
-
         self.unravel_fn = unravel_fn
-
-
-        ## stuff we need when using batches
-        self.N = N
-        self.B1 = B1
-        self.B2 = B2
-        self.factor = 1.0
-
-        # here I can already compute the factor_loss
-        if self.B1 is not None:
-            self.factor = N / B1
-            if self.B2 is not None:
-                self.factor = self.factor * (B2 / B1)
 
     @partial(jax.jit, static_argnums=(0))
     def CE_loss(self, param, data):

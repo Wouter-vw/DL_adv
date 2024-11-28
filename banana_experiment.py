@@ -43,8 +43,6 @@ def main(args):
     optimize_prior = args.optimize_prior
     print("Are we optimizing the prior? ", optimize_prior)
 
-    batch_data = args.batch_data
-
     # run with several seeds
     seed = args.seed
     jrandom.PRNGKey(seed)
@@ -239,138 +237,55 @@ def main(args):
         f_MAP = state.apply_fn(state.params, x_train)
 
         state_model_2 = create_train_state(rng, model, optimizer=optimizer)
-        
-        # here depending if I am using a diagonal approx, I have to redefine the model
-        if batch_data:
-            # Create a TensorFlow dataset
-            dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train, f_MAP))
-            
-            # Shuffle, batch and prefetch for performance optimization
-            new_train_loader = dataset.shuffle(buffer_size=len(x_train))  # Shuffling the entire dataset
-            new_train_loader = new_train_loader.batch(50)  # Batch size of 50
-            new_train_loader = new_train_loader.prefetch(tf.data.AUTOTUNE)  # Automatically tune the prefetch buffer size
 
         ########### All the lines below will not work until we have converted linearized_cross_entropy_manifold ####
         if optimize_prior:
-            if batch_data:
-                manifold = linearized_cross_entropy_manifold(
-                    model,
-                    state_model_2,
-                    new_train_loader,
-                    y=None,
-                    f_MAP=f_MAP,
-                    theta_MAP=map_solution,
-                    unravel_fn = unravel_fn,
-                    batching=True,
-                    lambda_reg=la.prior_precision.item() / 2,
-                )
-
-            else:
-                manifold = linearized_cross_entropy_manifold(
-                    model,
-                    state_model_2,
-                    x_train,
-                    y_train,
-                    f_MAP=f_MAP,
-                    theta_MAP=map_solution,
-                    unravel_fn = unravel_fn,
-                    batching=False,
-                    lambda_reg=la.prior_precision.item() / 2,
-                )
+            manifold = linearized_cross_entropy_manifold(
+                model,
+                state_model_2,
+                x_train,
+                y_train,
+                f_MAP=f_MAP,
+                theta_MAP=map_solution,
+                unravel_fn = unravel_fn,
+                batching=False,
+                lambda_reg=la.prior_precision.item() / 2,
+            )
         else:
-            if batch_data:
-                manifold = linearized_cross_entropy_manifold(
-                    model,
-                    state_model_2,
-                    new_train_loader,
-                    y=None,
-                    f_MAP=f_MAP,
-                    theta_MAP=map_solution,
-                    unravel_fn = unravel_fn,
-                    batching=True,
-                    lambda_reg=weight_decay,
-                )
-
-            else:
-                manifold = linearized_cross_entropy_manifold(
-                    model,
-                    state_model_2,
-                    x_train,
-                    y_train,
-                    f_MAP=f_MAP,
-                    theta_MAP=map_solution,
-                    unravel_fn = unravel_fn,
-                    batching=False,
-                    lambda_reg=weight_decay,
-                )
+            manifold = linearized_cross_entropy_manifold(
+                model,
+                state_model_2,
+                x_train,
+                y_train,
+                f_MAP=f_MAP,
+                theta_MAP=map_solution,
+                unravel_fn = unravel_fn,
+                batching=False,
+                lambda_reg=weight_decay,
+            )
     else:
         # here we have the usual manifold
         state_model_2 = create_train_state(rng, model, optimizer=optimizer)
 
         # here depending if I am using a diagonal approx, I have to redefine the model
         if optimize_prior:
-            if batch_data:
-                manifold = cross_entropy_manifold(
-                    model, state_model_2, train_loader, y=None, unravel_fn=unravel_fn, batching=True, lambda_reg=la.prior_precision.item() / 2
-                )
-
-            else:
-                manifold = cross_entropy_manifold(
-                    model, state_model_2, x_train, y_train, unravel_fn=unravel_fn, batching=False, lambda_reg=la.prior_precision.item() / 2
-                )
+            manifold = cross_entropy_manifold(
+                model, state_model_2, x_train, y_train, unravel_fn=unravel_fn, batching=False, lambda_reg=la.prior_precision.item() / 2
+            )
         else:
-            if batch_data:
-                manifold = cross_entropy_manifold(
-                    model, state_model_2, train_loader, y=None, unravel_fn=unravel_fn, batching=True, lambda_reg=weight_decay
-                )
+            manifold = cross_entropy_manifold(
+                model, state_model_2, x_train, y_train, unravel_fn=unravel_fn, batching=False, lambda_reg=weight_decay
+            )
 
-            else:
-                manifold = cross_entropy_manifold(
-                    model, state_model_2, x_train, y_train, unravel_fn=unravel_fn, batching=False, lambda_reg=weight_decay
-                )
+
     # now i have my manifold and so I can solve the expmap
     weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
     for n in tqdm(range(n_posterior_samples), desc="Solving expmap"):
         v = V_LA[n, :].reshape(-1, 1)
-            # here I can try to sample a subset of datapoints, create a new manifold and solve expmap
-        if args.expmap_different_batches:
-            n_sub_data = 150
-
-            idx_sub = jax.random.choice(rng, jnp.arange(len(x_train)), shape=(n_sub_data,), replace=False)
-            sub_x_train = x_train[idx_sub, :]
-            sub_y_train = y_train[idx_sub]
-            if args.linearized_pred:
-                sub_f_MAP = f_MAP[idx_sub]
-                manifold = linearized_cross_entropy_manifold(
-                    model,
-                    state_model_2,
-                    sub_x_train,
-                    sub_y_train,
-                    f_MAP=sub_f_MAP,
-                    theta_MAP=map_solution,
-                    unravel_fn=unravel_fn,
-                    batching=False,
-                    lambda_reg=la.prior_precision.item() / 2,
-                    N=len(x_train),
-                    B1=n_sub_data,
-                )
-            else:
-                manifold = cross_entropy_manifold(
-                    model,
-                    state_model_2,
-                    sub_x_train,
-                    sub_y_train,
-                    batching=False,
-                    lambda_reg=la.prior_precision.item() / 2,
-                    N=len(x_train),
-                    B1=n_sub_data,
-                )
-
-            curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
-        else:
-            curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
+        curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
         _new_weights = curve(1)[0]
         weights_ours = weights_ours.at[n, :].set(jnp.array(_new_weights.reshape(-1)))
+    
     # now I can use my weights for prediction. Deoending if I am using linearization or not the prediction looks differently
     if args.linearized_pred:
         state_model_2 = state_model_2.replace(params = unravel_fn(map_solution))
@@ -476,19 +391,11 @@ if __name__ == "__main__":
     parser.add_argument("--optimizer", "-optim", type=str, default="sgd", help="otpimizer used to train the model")
 
     parser.add_argument("--optimize_prior", "-opt_prior", type=bool, default=False, help="optimize prior")
-    parser.add_argument("--batch_data", "-batch", type=bool, default=False, help="batch data")
 
     parser.add_argument("--structure", "-str", type=str, default="full", help="Hessian struct for Laplace")
     parser.add_argument("--subset", "-sub", type=str, default="all", help="subset of weights for Laplace")
     parser.add_argument("--samples", "-samp", type=int, default=50, help="number of posterior samples")
     parser.add_argument("--linearized_pred", "-lin", type=bool, default=False, help="Linearization for prediction")
-    parser.add_argument(
-        "--expmap_different_batches",
-        "-batches",
-        type=bool,
-        default=False,
-        help="Solve exponential map using only a batch of the data and not the full dataset",
-    )
     parser.add_argument(
         "--test_all",
         "-test_all",
