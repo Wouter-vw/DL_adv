@@ -39,28 +39,21 @@ def geodesic_system(manifold, c, dc):
     ddc = np.zeros((D, N))
 
     # Diagonal Metric Case, M (N x D), dMdc_d (N x D x d=1,...,D) d-th column derivative with respect to c_d
-    if manifold.is_diagonal():
-        for n in range(N):
-            dMn = np.squeeze(dM[n, :, :])
-            ddc[:, n] = -0.5 * (2 * np.matmul(dMn * dc[:, n].reshape(-1, 1), dc[:, n])
-                                - np.matmul(dMn.T, (dc[:, n] ** 2))) / M[n, :]
+    M_inv = np.linalg.inv(M)  # N x D x D
+    Term1 = dM.reshape(N, D, D * D, order='F')  # N x D x D^2
+    Term2 = dM.reshape(N, D * D, D, order='F')  # N x D^2 x D
 
-    # Non-Diagonal Metric Case, M ( N x D x D ), dMdc_d (N x D x D x d=1,...,D)
-    else:
-        M_inv = np.linalg.inv(M)  # N x D x D
-        Term1 = dM.reshape(N, D, D * D, order='F')  # N x D x D^2
-        Term2 = dM.reshape(N, D * D, D, order='F')  # N x D^2 x D
+    for n in range(N):
+        # Mn = np.squeeze(M[n, :, :])
+        # if np.linalg.cond(Mn) < 1e-15:
+        #     print('Ill-condition metric!\n')
+        #     sys.exit(1)
 
-        for n in range(N):
-            # Mn = np.squeeze(M[n, :, :])
-            # if np.linalg.cond(Mn) < 1e-15:
-            #     print('Ill-condition metric!\n')
-            #     sys.exit(1)
+        # dvecMdcn = dM[n, :, :, :].reshape(D * D, D, order='F')
+        # blck = np.kron(np.eye(D), dc[:, n])
 
-            # dvecMdcn = dM[n, :, :, :].reshape(D * D, D, order='F')
-            # blck = np.kron(np.eye(D), dc[:, n])
-
-            ddc[:, n] = -0.5 * M_inv[n, :, :] @ ((2 * Term1[n, :, :] - Term2[n, :, :].T) @ np.kron(dc[:, n], dc[:, n]))
+        ddc[:, n] = -0.5 * M_inv[n, :, :] @ ((2 * Term1[n, :, :] - Term2[n, :, :].T) @ np.kron(dc[:, n], dc[:, n]))
+        
     return ddc
 
 

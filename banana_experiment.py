@@ -3,7 +3,6 @@ File containing the banana experiments
 """
 import torch
 import numpy as np
-import matplotlib
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom

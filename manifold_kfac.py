@@ -2,10 +2,6 @@ import jax
 import jax.numpy as jnp
 from jax import grad, jvp
 from functools import partial
-import flax
-import optax
-from dataclasses import dataclass
-from jax.scipy.special import logsumexp
 import tensorflow as tf
 import time
 
@@ -57,9 +53,6 @@ class linearized_cross_entropy_manifold:
             self.factor = N / B1
             if self.B2 is not None:
                 self.factor = self.factor * (B2 / B1)
-    @staticmethod
-    def is_diagonal():
-        return False
 
     @partial(jax.jit, static_argnums=(0))
     def CE_loss(self, param, data, f_MAP):
@@ -144,16 +137,17 @@ class linearized_cross_entropy_manifold:
             # Compute gradient covariance G
             G = jnp.matmul(grads.T, grads) / activations.shape[0]              # Shape: (n_out, n_out)
 
-            # Compute HVP for weights
-            weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
-            hvp_list.append(weight_hvp.flatten())
-
             # Bias terms
             grads_bias = ft_compute_grad['params'][layer_name]['bias']   # Shape: (n_out,)
             vel_bias = vel_as_params['params'][layer_name]['bias']       # Shape: (n_out,)
             G_bias = (grads_bias ** 2) / activations.shape[0]            # Shape: (n_out,)
             bias_hvp = G_bias * vel_bias                                 # Element-wise multiplication
             hvp_list.append(bias_hvp.flatten())
+
+            # Compute HVP for weights
+            weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
+            hvp_list.append(weight_hvp.flatten())
+
 
         return jnp.concatenate(hvp_list)
     
@@ -276,10 +270,6 @@ class cross_entropy_manifold:
             if self.B2 is not None:
                 self.factor = self.factor * (B2 / B1)
 
-    @staticmethod
-    def is_diagonal():
-        return False
-
     @partial(jax.jit, static_argnums=(0))
     def CE_loss(self, param, data):
         """
@@ -299,8 +289,6 @@ class cross_entropy_manifold:
             return jnp.sum(-jnp.take_along_axis(log_probs, targets[:, None], axis=-1))  # Use targets as indices
 
         return self.factor * criterion(y_pred, y)
-
-
 
     def L2_norm(self, param):
         """
@@ -322,11 +310,6 @@ class cross_entropy_manifold:
         ft_compute_grad = grad(self.L2_norm)
         ft_per_sample_grads = ft_compute_grad(params)
         return ft_per_sample_grads
-    
-    @partial(jax.jit, static_argnums=(0, 1))
-    def custom_hvp(self, f, primals, tangents):
-        grad_f = grad(f)
-        return jax.jvp(grad_f, primals, tangents)
     
     @partial(jax.jit, static_argnums=(0,4))
     def compute_kfac_hvp(self, intermediates, ft_compute_grad, vel_as_params, num_layers=3):
@@ -359,16 +342,17 @@ class cross_entropy_manifold:
             # Compute gradient covariance G
             G = jnp.matmul(grads.T, grads) / activations.shape[0]              # Shape: (n_out, n_out)
 
-            # Compute HVP for weights
-            weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
-            hvp_list.append(weight_hvp.flatten())
-
             # Bias terms
             grads_bias = ft_compute_grad['params'][layer_name]['bias']   # Shape: (n_out,)
             vel_bias = vel_as_params['params'][layer_name]['bias']       # Shape: (n_out,)
             G_bias = (grads_bias ** 2) / activations.shape[0]            # Shape: (n_out,)
             bias_hvp = G_bias * vel_bias                                 # Element-wise multiplication
             hvp_list.append(bias_hvp.flatten())
+
+            # Compute HVP for weights
+            weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
+            hvp_list.append(weight_hvp.flatten())
+
 
         return jnp.concatenate(hvp_list)
   
