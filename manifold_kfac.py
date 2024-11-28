@@ -1,11 +1,3 @@
-"""
-File containing all the manifold we are going to use for the experiments:
-- Regression manifold
-- Linearized regression manifold
-- Cross entropy manifold
-- Linearized cross entropy manifold
-"""
-
 import jax
 import jax.numpy as jnp
 from jax import grad, jvp

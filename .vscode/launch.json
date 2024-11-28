@@ -11,14 +11,13 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "-s=0",
+                "-s=2",
                 "-str=full",
                 "-sub=all",
                 "-samp=100",
                 "-optim=sgd",
-                "-opt_prior=True",
-                "-lin=True"
-            ]
+                "-opt_prior=True"
+                        ]
         }
     ]
 }

@@ -27,7 +27,7 @@ from torch import nn as nn_torch
 from manifold_kfac import linearized_cross_entropy_manifold, cross_entropy_manifold
 #########################################
 from tqdm import tqdm
-from utils.metrics import accuracy, nll, brier
+from evaluation import accuracy, nll, brier
 import argparse
 from torchmetrics.functional.classification import calibration_error
 
