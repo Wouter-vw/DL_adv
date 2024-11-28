@@ -152,16 +152,16 @@ class linearized_cross_entropy_manifold:
             # Compute gradient covariance G
             G = jnp.matmul(grads.T, grads) / activations.shape[0]              # Shape: (n_out, n_out)
 
-            # Compute HVP for weights
-            weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
-            hvp_list.append(weight_hvp.flatten())
-
             # Bias terms
             grads_bias = ft_compute_grad['params'][layer_name]['bias']   # Shape: (n_out,)
             vel_bias = vel_as_params['params'][layer_name]['bias']       # Shape: (n_out,)
             G_bias = (grads_bias ** 2) / activations.shape[0]            # Shape: (n_out,)
             bias_hvp = G_bias * vel_bias                                 # Element-wise multiplication
             hvp_list.append(bias_hvp.flatten())
+
+            # Compute HVP for weights
+            weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
+            hvp_list.append(weight_hvp.flatten())
 
         return jnp.concatenate(hvp_list)
     
@@ -367,16 +367,16 @@ class cross_entropy_manifold:
             # Compute gradient covariance G
             G = jnp.matmul(grads.T, grads) / activations.shape[0]              # Shape: (n_out, n_out)
 
-            # Compute HVP for weights
-            weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
-            hvp_list.append(weight_hvp.flatten())
-
             # Bias terms
             grads_bias = ft_compute_grad['params'][layer_name]['bias']   # Shape: (n_out,)
             vel_bias = vel_as_params['params'][layer_name]['bias']       # Shape: (n_out,)
             G_bias = (grads_bias ** 2) / activations.shape[0]            # Shape: (n_out,)
             bias_hvp = G_bias * vel_bias                                 # Element-wise multiplication
             hvp_list.append(bias_hvp.flatten())
+
+            # Compute HVP for weights
+            weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
+            hvp_list.append(weight_hvp.flatten())
 
         return jnp.concatenate(hvp_list)
   
