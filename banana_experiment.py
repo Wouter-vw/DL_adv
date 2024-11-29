@@ -25,7 +25,7 @@ import geomai.utils.geometry as geometry
 from torch import nn as nn_torch
 
 ########################################
-from manifold_kfac import linearized_cross_entropy_manifold, cross_entropy_manifold
+from manifold_kfac import LinearizedCrossEntropyManifold, CrossEntropyManifold
 
 #########################################
 from tqdm import tqdm
@@ -268,9 +268,9 @@ def main(args):
 
         state_model_2 = create_train_state(rng, model, optimizer=optimizer)
 
-        ########### All the lines below will not work until we have converted linearized_cross_entropy_manifold ####
+        ########### All the lines below will not work until we have converted LinearizedCrossEntropyManifold ####
         if optimize_prior:
-            manifold = linearized_cross_entropy_manifold(
+            manifold = LinearizedCrossEntropyManifold(
                 model,
                 state_model_2,
                 x_train,
@@ -282,7 +282,7 @@ def main(args):
                 lambda_reg=la.prior_precision.item() / 2,
             )
         else:
-            manifold = linearized_cross_entropy_manifold(
+            manifold = LinearizedCrossEntropyManifold(
                 model,
                 state_model_2,
                 x_train,
@@ -299,7 +299,7 @@ def main(args):
 
         # here depending if I am using a diagonal approx, I have to redefine the model
         if optimize_prior:
-            manifold = cross_entropy_manifold(
+            manifold = CrossEntropyManifold(
                 model,
                 state_model_2,
                 x_train,
@@ -309,7 +309,7 @@ def main(args):
                 lambda_reg=la.prior_precision.item() / 2,
             )
         else:
-            manifold = cross_entropy_manifold(
+            manifold = CrossEntropyManifold(
                 model,
                 state_model_2,
                 x_train,

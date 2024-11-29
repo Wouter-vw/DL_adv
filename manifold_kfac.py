@@ -6,7 +6,7 @@ import tensorflow as tf
 import time
 
 
-class linearized_cross_entropy_manifold:
+class LinearizedCrossEntropyManifold:
     """
     Also in this case I have to separate data fitting term and regularization term for gradient and
     hessian computation in case of batches.
@@ -14,92 +14,96 @@ class linearized_cross_entropy_manifold:
 
     def __init__(
         self,
-        model,
-        state_model,
-        X,
-        y,
+        neural_network,
+        model_state,
+        input_data,
+        target_labels,
         f_MAP,
         theta_MAP,
         unravel_fn,
         batching=False,
         lambda_reg=None,
     ):
-        self.model = model
-        self.state = state_model
-        self.X = X
-        self.y = y
-        self.N = len(self.X)
+        self.neural_network = neural_network
+        self.model_state = model_state
+        self.input_data = input_data
+        self.target_labels = target_labels
+        self.N = len(self.input_data)
         self.batching = batching
-        self.type = type
         self.lambda_reg = lambda_reg
         self.theta_MAP = theta_MAP
         self.f_MAP = f_MAP
-        # Initialize model parameters
+        # Initialize neural_network parameters
         self.params = theta_MAP
         self.unravel_fn = unravel_fn
-        self.factor = 1.0
 
     @partial(jax.jit, static_argnums=(0))
-    def CE_loss(self, param, data, f_MAP):
+    def cross_entropy_loss(self, parameters, data, f_MAP):
         """
         Data fitting term of the loss
         """
 
         def predict(params, datas):
-            y_preds = self.state.apply_fn(params, datas)
+            y_preds = self.model_state.apply_fn(params, datas)
             return y_preds
 
         x, y = data
 
         params_map = self.unravel_fn(self.theta_MAP)
-        diff_weights = jax.tree_util.tree_map(lambda p, m: (p - m).astype(m.dtype), param, self.params_map)
+        diff_weights = jax.tree_util.tree_map(
+            lambda p, m: (p - m).astype(m.dtype), parameters, self.params_map
+        )
         _, jvp_value = jvp(predict, (params_map, x), (diff_weights, jnp.zeros_like(x)))
 
         y_pred = f_MAP + jvp_value
-        
+
         def criterion(predictions, targets):
             # Apply softmax to predictions to get probabilities
             probs = jax.nn.softmax(predictions, axis=-1)
-            
+
             # Use log of probabilities to get log-probabilities
             log_probs = jnp.log(probs)
-            
+
             # Use targets as indices (not one-hot encoded)
-            return jnp.sum(-jnp.take_along_axis(log_probs, targets[:, None], axis=-1))  # Use targets as indices
-        
-        return self.factor * criterion(y_pred, y)
+            return jnp.sum(
+                -jnp.take_along_axis(log_probs, targets[:, None], axis=-1)
+            )  # Use targets as indices
 
+        return criterion(y_pred, y)
 
-    def L2_norm(self, param):
+    def L2_norm(self, parameters):
         """
         L2 regularization. I need this separate from the loss for the gradient computation.
         """
         # Sum squared values of the parameters
-        w_norm = sum(jnp.sum(w ** 2) for w in jax.tree_util.tree_leaves(param['params']))
+        w_norm = sum(
+            jnp.sum(w**2) for w in jax.tree_util.tree_leaves(parameters["params"])
+        )
         return self.lambda_reg * w_norm
 
     @partial(jax.jit, static_argnums=(0))
-    def compute_grad_data_fitting_term(self, params, data, f_MAP):
-        ft_compute_grad = grad(self.CE_loss)
-
-        ft_per_sample_grads = ft_compute_grad(params, data, f_MAP)
-        return ft_per_sample_grads
+    def compute_data_term_gradient(self, params, data, f_MAP):
+        gradient_fun = grad(self.cross_entropy_loss)
+        gradient_tree = gradient_fun(params, data, f_MAP)
+        return gradient_tree
 
     @partial(jax.jit, static_argnums=(0))
-    def compute_grad_L2_reg(self, params):
-        ft_compute_grad = grad(self.L2_norm)
-        ft_per_sample_grads = ft_compute_grad(params)
-        return ft_per_sample_grads
-    
-    @partial(jax.jit, static_argnums=(0,4))
-    def compute_kfac_hvp(self, intermediates, ft_compute_grad, vel_as_params, num_layers=3):
+    def compute_regularization_gradient(self, params):
+        gradient_fun = grad(self.L2_norm)
+        gradient_tree = gradient_fun(params)
+        return gradient_tree
+
+    @partial(jax.jit, static_argnums=(0, 4))
+    def compute_kfac_hvp(
+        self, intermediates, gradient_tree, velocity_tree, num_layers=3
+    ):
         """
         Compute the Hessian-vector product (HVP) using K-FAC approximation.
-        
+
         Args:
             intermediates (dict): Intermediate activations from the forward pass.
-            ft_compute_grad (dict): Gradients of the parameters.
-            vel_as_params (dict): Velocity vector in parameter space.
+            gradient_tree (dict): Gradients of the parameters.
+            velocity_tree (dict): Velocity vector in parameter space.
             num_layers (int): Number of layers to process.
 
         Returns:
@@ -108,69 +112,81 @@ class linearized_cross_entropy_manifold:
         hvp_list = []
 
         for i in range(num_layers):
-            layer_name = f'Dense_{i}'
-            interm_key = f'in_{i}'
+            layer_name = f"Dense_{i}"
+            interm_key = f"in_{i}"
 
             # Extract activations and gradients
-            activations = intermediates['intermediates'][interm_key][0]  # Shape: (batch_size, n_in)
-            grads = ft_compute_grad['params'][layer_name]['kernel']      # Shape: (n_in, n_out)
-            vel = vel_as_params['params'][layer_name]['kernel']          # Shape: (n_in, n_out)
+            activations = intermediates["intermediates"][interm_key][
+                0
+            ]  # Shape: (batch_size, n_in)
+            grads = gradient_tree["params"][layer_name][
+                "kernel"
+            ]  # Shape: (n_in, n_out)
+            vel = velocity_tree["params"][layer_name]["kernel"]  # Shape: (n_in, n_out)
 
             # Compute activation covariance A
-            A = jnp.matmul(activations.T, activations) / activations.shape[0]  # Shape: (n_in, n_in)
+            A = (
+                jnp.matmul(activations.T, activations) / activations.shape[0]
+            )  # Shape: (n_in, n_in)
 
             # Compute gradient covariance G
-            G = jnp.matmul(grads.T, grads) / activations.shape[0]              # Shape: (n_out, n_out)
+            G = (
+                jnp.matmul(grads.T, grads) / activations.shape[0]
+            )  # Shape: (n_out, n_out)
 
             # Bias terms
-            grads_bias = ft_compute_grad['params'][layer_name]['bias']   # Shape: (n_out,)
-            vel_bias = vel_as_params['params'][layer_name]['bias']       # Shape: (n_out,)
-            G_bias = (grads_bias ** 2) / activations.shape[0]            # Shape: (n_out,)
-            bias_hvp = G_bias * vel_bias                                 # Element-wise multiplication
+            grads_bias = gradient_tree["params"][layer_name]["bias"]  # Shape: (n_out,)
+            vel_bias = velocity_tree["params"][layer_name]["bias"]  # Shape: (n_out,)
+            G_bias = (grads_bias**2) / activations.shape[0]  # Shape: (n_out,)
+            bias_hvp = G_bias * vel_bias  # Element-wise multiplication
             hvp_list.append(bias_hvp.flatten())
 
             # Compute HVP for weights
             weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
             hvp_list.append(weight_hvp.flatten())
 
-
         return jnp.concatenate(hvp_list)
-    
+
     @partial(jax.jit, static_argnums=(0,))
     def geodesic_system(self, current_point, velocity, return_hvp=False):
+        data = (self.input_data, self.target_labels)
 
-        data = (self.X, self.y)
-
-        # let's start by putting the current points into the model
-        state = self.state.replace(params = self.unravel_fn(current_point))
+        # let's start by putting the current points into the neural_network
+        model_state = self.model_state.replace(params=self.unravel_fn(current_point))
 
         # now I have everything to compute the the second derivative
         # let's compute the gradient
-        grad_data_fitting_term = 0
+        data_term_gradient = 0
         params = self.unravel_fn(current_point)
-        self.params_map = self.unravel_fn(self.theta_MAP)            
-        grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data, self.f_MAP)
+        self.params_map = self.unravel_fn(self.theta_MAP)
+        data_term_gradient = self.compute_data_term_gradient(params, data, self.f_MAP)
 
         # here now I have to compute also the gradient of the regularization term
         # Compute gradient of the regularization term
         if self.lambda_reg is not None:
-            grad_reg = self.compute_grad_L2_reg(params)
+            regularization_gradient = self.compute_regularization_gradient(params)
         else:
-            grad_reg = None
+            regularization_gradient = None
 
         # Combine gradients
-        tot_gradient = grad_data_fitting_term
-        if grad_reg is not None:
-            tot_gradient = jax.tree_util.tree_map(lambda x, y: x + y, tot_gradient, grad_reg)
+        tot_gradient = data_term_gradient
+        if regularization_gradient is not None:
+            tot_gradient = jax.tree_util.tree_map(
+                lambda x, y: x + y, tot_gradient, regularization_gradient
+            )
 
         tot_gradient = jax.flatten_util.ravel_pytree(tot_gradient)[0]
 
-        vel_as_params = self.unravel_fn(velocity)
+        velocity_tree = self.unravel_fn(velocity)
 
         start = time.time()
         hvp_data_fitting = 0
-        _, intermediates = self.model.apply(state.params, data[0], mutable=['intermediates'])
-        hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
+        _, intermediates = self.neural_network.apply(
+            model_state.params, data[0], mutable=["intermediates"]
+        )
+        hvp_data_fitting = self.compute_kfac_hvp(
+            intermediates, data_term_gradient, velocity_tree, num_layers=3
+        )
 
         # I have to add the hvp of the regularization term
         if self.lambda_reg is not None:
@@ -181,16 +197,18 @@ class linearized_cross_entropy_manifold:
             tot_hvp = hvp_data_fitting
         end = time.time()
 
-        second_derivative = -((tot_gradient / (1 + tot_gradient.T @ tot_gradient)) * (velocity.T @ tot_hvp)).flatten()
+        second_derivative = -(
+            (tot_gradient / (1 + tot_gradient.T @ tot_gradient))
+            * (velocity.T @ tot_hvp)
+        ).flatten()
 
         if return_hvp:
             return second_derivative.reshape(-1, 1), tot_hvp.reshape(-1, 1)
         else:
             return second_derivative.reshape(-1, 1)
-        
 
 
-class cross_entropy_manifold:
+class CrossEntropyManifold:
     """
     Also in this case I have to split the gradient loss computation and the gradient of the regularization
     term.
@@ -199,75 +217,79 @@ class cross_entropy_manifold:
 
     def __init__(
         self,
-        model, 
-        state_model, 
-        X, 
-        y,
-        unravel_fn, 
-        batching=False, 
-        lambda_reg=None
+        neural_network,
+        model_state,
+        input_data,
+        target_labels,
+        unravel_fn,
+        batching=False,
+        lambda_reg=None,
     ):
-        self.model = model
-        self.state = state_model
-        self.X = X
-        self.y = y
-        self.N = len(self.X)
+        self.neural_network = neural_network
+        self.model_state = model_state
+        self.input_data = input_data
+        self.target_labels = target_labels
+        self.N = len(self.input_data)
         self.batching = batching
-        self.type = type
         self.lambda_reg = lambda_reg
         self.unravel_fn = unravel_fn
-        self.factor = 1.0
 
     @partial(jax.jit, static_argnums=(0))
-    def CE_loss(self, param, data):
+    def cross_entropy_loss(self, parameters, data):
         """
         Data fitting term of the loss
         """
         x, y = data
-        y_pred = self.state.apply_fn(param, x)
+        y_pred = self.model_state.apply_fn(parameters, x)
 
         def criterion(predictions, targets):
             # Apply softmax to predictions to get probabilities
             probs = jax.nn.softmax(predictions, axis=-1)
-            
+
             # Use log of probabilities to get log-probabilities
             log_probs = jnp.log(probs)
-            
+
             # Use targets as indices (not one-hot encoded)
-            return jnp.sum(-jnp.take_along_axis(log_probs, targets[:, None], axis=-1))  # Use targets as indices
+            return jnp.sum(
+                -jnp.take_along_axis(log_probs, targets[:, None], axis=-1)
+            )  # Use targets as indices
 
-        return self.factor * criterion(y_pred, y)
+        return criterion(y_pred, y)
 
-    def L2_norm(self, param):
+    def L2_norm(self, parameters):
         """
         L2 regularization. I need this separate from the loss for the gradient computation.
         """
         # Sum squared values of the parameters
-        w_norm = sum(jnp.sum(w ** 2) for w in jax.tree_util.tree_leaves(param['params']))
+        w_norm = sum(
+            jnp.sum(w**2) for w in jax.tree_util.tree_leaves(parameters["params"])
+        )
         return self.lambda_reg * w_norm
 
     @partial(jax.jit, static_argnums=(0))
-    def compute_grad_data_fitting_term(self, params, data):
-        ft_compute_grad = grad(self.CE_loss)
+    def compute_data_term_gradient(self, params, data):
+        gradient_fun = grad(self.cross_entropy_loss)
 
-        ft_per_sample_grads = ft_compute_grad(params, data)
-        return ft_per_sample_grads
+        gradient_tree = gradient_fun(params, data)
+        return gradient_tree
 
     @partial(jax.jit, static_argnums=(0))
-    def compute_grad_L2_reg(self, params):
-        ft_compute_grad = grad(self.L2_norm)
-        ft_per_sample_grads = ft_compute_grad(params)
-        return ft_per_sample_grads
-    
-    @partial(jax.jit, static_argnums=(0,4))
-    def compute_kfac_hvp(self, intermediates, ft_compute_grad, vel_as_params, num_layers=3):
+    def compute_regularization_gradient(self, params):
+        gradient_fun = grad(self.L2_norm)
+        gradient_tree = gradient_fun(params)
+        return gradient_tree
+
+    @partial(jax.jit, static_argnums=(0, 4))
+    def compute_kfac_hvp(
+        self, intermediates, gradient_tree, velocity_tree, num_layers=3
+    ):
         """
         Compute the Hessian-vector product (HVP) using K-FAC approximation.
-        
+
         Args:
             intermediates (dict): Intermediate activations from the forward pass.
-            ft_compute_grad (dict): Gradients of the parameters.
-            vel_as_params (dict): Velocity vector in parameter space.
+            gradient_tree (dict): Gradients of the parameters.
+            velocity_tree (dict): Velocity vector in parameter space.
             num_layers (int): Number of layers to process.
 
         Returns:
@@ -276,69 +298,81 @@ class cross_entropy_manifold:
         hvp_list = []
 
         for i in range(num_layers):
-            layer_name = f'Dense_{i}'
-            interm_key = f'in_{i}'
+            layer_name = f"Dense_{i}"
+            interm_key = f"in_{i}"
 
             # Extract activations and gradients
-            activations = intermediates['intermediates'][interm_key][0]  # Shape: (batch_size, n_in)
-            grads = ft_compute_grad['params'][layer_name]['kernel']      # Shape: (n_in, n_out)
-            vel = vel_as_params['params'][layer_name]['kernel']          # Shape: (n_in, n_out)
+            activations = intermediates["intermediates"][interm_key][
+                0
+            ]  # Shape: (batch_size, n_in)
+            grads = gradient_tree["params"][layer_name][
+                "kernel"
+            ]  # Shape: (n_in, n_out)
+            vel = velocity_tree["params"][layer_name]["kernel"]  # Shape: (n_in, n_out)
 
             # Compute activation covariance A
-            A = jnp.matmul(activations.T, activations) / activations.shape[0]  # Shape: (n_in, n_in)
+            A = (
+                jnp.matmul(activations.T, activations) / activations.shape[0]
+            )  # Shape: (n_in, n_in)
 
             # Compute gradient covariance G
-            G = jnp.matmul(grads.T, grads) / activations.shape[0]              # Shape: (n_out, n_out)
+            G = (
+                jnp.matmul(grads.T, grads) / activations.shape[0]
+            )  # Shape: (n_out, n_out)
 
             # Bias terms
-            grads_bias = ft_compute_grad['params'][layer_name]['bias']   # Shape: (n_out,)
-            vel_bias = vel_as_params['params'][layer_name]['bias']       # Shape: (n_out,)
-            G_bias = (grads_bias ** 2) / activations.shape[0]            # Shape: (n_out,)
-            bias_hvp = G_bias * vel_bias                                 # Element-wise multiplication
+            grads_bias = gradient_tree["params"][layer_name]["bias"]  # Shape: (n_out,)
+            vel_bias = velocity_tree["params"][layer_name]["bias"]  # Shape: (n_out,)
+            G_bias = (grads_bias**2) / activations.shape[0]  # Shape: (n_out,)
+            bias_hvp = G_bias * vel_bias  # Element-wise multiplication
             hvp_list.append(bias_hvp.flatten())
 
             # Compute HVP for weights
             weight_hvp = jnp.matmul(A, jnp.matmul(vel, G))  # Shape: (n_in, n_out)
             hvp_list.append(weight_hvp.flatten())
 
-
         return jnp.concatenate(hvp_list)
-  
+
     @partial(jax.jit, static_argnums=(0,))
     def geodesic_system(self, current_point, velocity, return_hvp=False):
+        data = (self.input_data, self.target_labels)
 
-        data = (self.X, self.y)
-
-        # let's start by putting the current points into the model
-        state = self.state.replace(params = self.unravel_fn(current_point))
+        # let's start by putting the current points into the neural_network
+        model_state = self.model_state.replace(params=self.unravel_fn(current_point))
 
         # now I have everything to compute the the second derivative
         # let's compute the gradient
-        grad_data_fitting_term = 0
+        data_term_gradient = 0
         params = self.unravel_fn(current_point)
-        grad_data_fitting_term = self.compute_grad_data_fitting_term(params, data)
+        data_term_gradient = self.compute_data_term_gradient(params, data)
 
         # here now I have to compute also the gradient of the regularization term
         if self.lambda_reg is not None:
             # I have to compute the L2 reg gradient
-            grad_reg = self.compute_grad_L2_reg(params)
+            regularization_gradient = self.compute_regularization_gradient(params)
         else:
-            grad_reg = None
+            regularization_gradient = None
 
-        tot_gradient = grad_data_fitting_term
-        if grad_reg is not None:
-            tot_gradient = jax.tree_util.tree_map(lambda x, y: x + y, tot_gradient, grad_reg)
+        tot_gradient = data_term_gradient
+        if regularization_gradient is not None:
+            tot_gradient = jax.tree_util.tree_map(
+                lambda x, y: x + y, tot_gradient, regularization_gradient
+            )
 
         tot_gradient = jax.flatten_util.ravel_pytree(tot_gradient)[0]
 
         # and I have to reshape the velocity into being the same structure as the params
-        vel_as_params = self.unravel_fn(velocity)
+        velocity_tree = self.unravel_fn(velocity)
 
         # now I have also to compute the Hvp between hessian and velocity
         start = time.time()
         hvp_data_fitting = 0
-        _, intermediates = self.model.apply(state.params, data[0], mutable=['intermediates'])
-        hvp_data_fitting = self.compute_kfac_hvp(intermediates, grad_data_fitting_term, vel_as_params, num_layers=3)
+        _, intermediates = self.neural_network.apply(
+            model_state.params, data[0], mutable=["intermediates"]
+        )
+        hvp_data_fitting = self.compute_kfac_hvp(
+            intermediates, data_term_gradient, velocity_tree, num_layers=3
+        )
 
         # I have to add the hvp of the regularization term
         if self.lambda_reg is not None:
@@ -349,7 +383,10 @@ class cross_entropy_manifold:
             tot_hvp = hvp_data_fitting
         end = time.time()
 
-        second_derivative = -((tot_gradient / (1 + tot_gradient.T @ tot_gradient)) * (velocity.T @ tot_hvp)).flatten()
+        second_derivative = -(
+            (tot_gradient / (1 + tot_gradient.T @ tot_gradient))
+            * (velocity.T @ tot_hvp)
+        ).flatten()
 
         if return_hvp:
             return second_derivative.reshape(-1, 1), tot_hvp.view(-1, 1)
