@@ -59,7 +59,6 @@ def rearrange_velocity_samples_laplace(test):
     return velocity_samples_laplace_jax
 
 
-@profile
 def main(args):
     print("Linearization?")
     print(args.linearized_pred)
