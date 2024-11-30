@@ -14,6 +14,15 @@ from laplace import Laplace
 from torch import nn as nn_torch
 from torchmetrics.functional.classification import calibration_error
 from tqdm import tqdm
+####################################
+import warnings
+
+# Suppresses an irrelevant warning from the laplace package
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module=r".*laplace\.baselaplace"
+)
 
 #####################################
 
@@ -209,7 +218,7 @@ def main(args):
     #     velocity_samples_laplace = samples
 
     # else:
-    scale_tril = scale_tril = jnp.array(la.posterior_scale)
+    scale_tril = jnp.array(la.posterior_scale)
     velocity_samples_laplace = jax.random.multivariate_normal(
         rng,
         mean=jnp.zeros_like(map_solution),
@@ -396,6 +405,18 @@ def main(args):
     # ece = calibration_error(test_posterior_probabilities, y_test, norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
     # mce = calibration_error(test_posterior_probabilities, y_test, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
 
+
+    ## Lets compare to the MAP Estimates too!
+    state = state.replace(params=unravel_fn(map_solution))
+    P_test_MAP = jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
+    accuracy_MAP = accuracy(P_test_MAP, y_test)
+    nll_MAP = nll(P_test_MAP, y_test)
+    brier_MAP = brier(P_test_MAP, y_test)
+    MAP_probs_torch = torch.from_numpy(np.array(P_test_MAP))
+    ece_map = calibration_error(MAP_probs_torch, y_test_torch, norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
+    mce_map = calibration_error(MAP_probs_torch, y_test_torch, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
+
+    print(f"Results MAP: accuracy {accuracy_MAP}, nll {nll_MAP}, brier {brier_MAP}, ECE {ece_map}, MCE {mce_map}")
     print(f"Results: accuracy {accuracy_posterior}, nll {negative_log_likelihood}, brier {brier_score}, ECE {ece}, MCE {mce}")
 
 
