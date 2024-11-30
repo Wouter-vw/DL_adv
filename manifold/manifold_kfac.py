@@ -2,8 +2,9 @@ import jax
 import jax.numpy as jnp
 from jax import grad, jvp
 from functools import partial
-import tensorflow as tf
 import time
+
+jax.config.update("jax_enable_x64", True)
 
 
 class LinearizedCrossEntropyManifold:

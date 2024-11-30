@@ -5,13 +5,10 @@ import torch
 from scipy.integrate import solve_ivp
 import scipy.integrate as integrate
 import matplotlib.pyplot as plt
-# import sklearn.neighbors.graph as knn_graph
-from scipy.interpolate import CubicSpline
-# from csaps import csaps
 
 
 # Draws an elipsoid that correspond to the metric
-def plot_metric(x, cov, color='r', inverse_metric=False, linewidth=1):
+def plot_metric(x, cov, color="r", inverse_metric=False, linewidth=1):
     eigvals, eigvecs = np.linalg.eig(cov)
     N = 100
     theta = np.linspace(0, 2 * np.pi, N)
@@ -20,7 +17,7 @@ def plot_metric(x, cov, color='r', inverse_metric=False, linewidth=1):
     points = points * np.sqrt(eigvals)
     points = np.matmul(eigvecs, points.transpose()).transpose()
     points = points + x.flatten()
-    plt.plot(points[:, 0], points[:, 1], c=color, linewidth=linewidth, label='Metric')
+    plt.plot(points[:, 0], points[:, 1], c=color, linewidth=linewidth, label="Metric")
 
 
 # This function evaluates the differential equation c'' = f(c, c')
@@ -29,7 +26,7 @@ def geodesic_system(manifold, c, dc):
 
     D, N = c.shape
     if (dc.shape[0] != D) | (dc.shape[1] != N):
-        print('geodesic_system: second and third input arguments must have same dimensionality\n')
+        print("geodesic_system: second and third input arguments must have same dimensionality\n")
         sys.exit(1)
 
     # Evaluate the metric and the derivative
@@ -40,8 +37,8 @@ def geodesic_system(manifold, c, dc):
 
     # Diagonal Metric Case, M (N x D), dMdc_d (N x D x d=1,...,D) d-th column derivative with respect to c_d
     M_inv = np.linalg.inv(M)  # N x D x D
-    Term1 = dM.reshape(N, D, D * D, order='F')  # N x D x D^2
-    Term2 = dM.reshape(N, D * D, D, order='F')  # N x D^2 x D
+    Term1 = dM.reshape(N, D, D * D, order="F")  # N x D x D^2
+    Term2 = dM.reshape(N, D * D, D, order="F")  # N x D^2 x D
 
     for n in range(N):
         # Mn = np.squeeze(M[n, :, :])
@@ -53,7 +50,7 @@ def geodesic_system(manifold, c, dc):
         # blck = np.kron(np.eye(D), dc[:, n])
 
         ddc[:, n] = -0.5 * M_inv[n, :, :] @ ((2 * Term1[n, :, :] - Term2[n, :, :].T) @ np.kron(dc[:, n], dc[:, n]))
-        
+
     return ddc
 
 
@@ -68,7 +65,7 @@ def second2first_order(manifold, state, subset_of_weights):
 
     c = state[:D, :]  # D x N
     cm = state[D:, :]  # D x N
-    if subset_of_weights == 'last_layer':
+    if subset_of_weights == "last_layer":
         # in the last layer case we can use the old implementation
         cmm = geodesic_system(manifold, c, cm)  # D x N
     else:
@@ -127,7 +124,7 @@ def local_length(manifold, curve, t):
     D = c.shape[0]
     M = manifold.metric_tensor(c, nargout=1)
     if manifold.is_diagonal():
-        dist = np.sqrt(np.sum(M.transpose() * (dc ** 2), axis=0))  # T x 1, c'(t) M(c(t)) c'(t)
+        dist = np.sqrt(np.sum(M.transpose() * (dc**2), axis=0))  # T x 1, c'(t) M(c(t)) c'(t)
     else:
         dc = dc.T  # D x N -> N x D
         dc_rep = np.repeat(dc[:, :, np.newaxis], D, axis=2)  # N x D -> N x D x D
@@ -163,16 +160,16 @@ def plot_curve(curve, **kwargs):
     elif D == 3:
         plt.plot(curve_eval[0, :], curve_eval[1, :], curve_eval[2, :], **kwargs)
 
+
 # This function vectorizes an matrix by stacking the columns
 def vec(x):
     # Input: x (NxD) -> (ND x 1)
-    return x.flatten('F').reshape(-1, 1)
-
+    return x.flatten("F").reshape(-1, 1)
 
 
 # This function implements the exponential map
-def expmap(manifold, x, v, subset_of_weights='all'):
-    assert subset_of_weights == 'all' or subset_of_weights == 'last_layer', 'subset_of_weights must be all or last_layer'
+def expmap(manifold, x, v, subset_of_weights="all"):
+    assert subset_of_weights == "all" or subset_of_weights == "last_layer", "subset_of_weights must be all or last_layer"
 
     # Input: v,x (Dx1)
     x = x.reshape(-1, 1)
@@ -184,8 +181,7 @@ def expmap(manifold, x, v, subset_of_weights='all'):
         # print('I think we should enter here')
         curve, failed = new_solve_expmap(manifold, x, v, ode_fun, subset_of_weights)
     else:
-        curve = lambda t: (x.reshape(D, 1).repeat(np.size(t), axis=1),
-                           v.reshape(D, 1).repeat(np.size(t), axis=1))  # Return tuple (2D x T)
+        curve = lambda t: (x.reshape(D, 1).repeat(np.size(t), axis=1), v.reshape(D, 1).repeat(np.size(t), axis=1))  # Return tuple (2D x T)
         failed = True
 
     return curve, failed
@@ -199,7 +195,7 @@ def new_solve_expmap(manifold, x, v, ode_fun, subset_of_weights):
         v = v.cpu().numpy()
     if isinstance(x, torch.Tensor):
         x = x.cpu().numpy()
-        
+
     init = np.concatenate((x, v), axis=0).flatten()  # 2D x 1 -> (2D, ), the solver needs this shape
 
     failed = False
@@ -207,7 +203,7 @@ def new_solve_expmap(manifold, x, v, ode_fun, subset_of_weights):
     prev_t = 0
     t = 1
 
-    solution = solve_ivp(ode_fun, [prev_t, t], init, dense_output=True, atol = 1e-3, rtol= 1e-6)  # First solution of the IVP problem
+    solution = solve_ivp(ode_fun, [prev_t, t], init, dense_output=True, atol=1e-3, rtol=1e-6)  # First solution of the IVP problem
     curve = lambda tt: evaluate_solution(solution, tt, 1)  # with length(c(t)) != ||v||_c
-    
+
     return curve, failed

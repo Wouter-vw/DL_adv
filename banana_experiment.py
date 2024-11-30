@@ -2,46 +2,67 @@
 File containing the banana experiments
 """
 
-import torch
-import numpy as np
+import argparse
+
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
-
-from torch2jax import t2j
-
+import numpy as np
 import optax
-
-from neural_network import MLP, create_train_state, compute_loss, train_step
-from data_loading import load_banana_data, create_data_loader
-from plots import plot_map_confidence, plot_ours_confidence
-
+import torch
 from laplace import Laplace
+from torch import nn as nn_torch
+from torchmetrics.functional.classification import calibration_error
+from tqdm import tqdm
 
 #####################################
-import geomai.utils.geometry as geometry
 
-####################################################
-from torch import nn as nn_torch
-
-########################################
-from manifold_kfac import LinearizedCrossEntropyManifold, CrossEntropyManifold
-
-#########################################
-from tqdm import tqdm
-from evaluation import accuracy, nll, brier
-import argparse
-from torchmetrics.functional.classification import calibration_error
-
+import manifold.geometry as geometry
+from manifold.manifold_kfac import CrossEntropyManifold, LinearizedCrossEntropyManifold
+from utils.data_loading import create_data_loader, load_banana_data
+from utils.evaluation import accuracy, brier, nll
+from utils.neural_network import MLP, compute_loss, create_train_state, train_step
+from utils.plots import plot_map_confidence, plot_ours_confidence
 
 jax.config.update("jax_enable_x64", True)
 
 
+@jax.jit
+def rearrange_velocity_samples_laplace(test):
+    # Initialize the output array
+    velocity_samples_laplace_jax = jnp.zeros(354, dtype=test.dtype)
+
+    # Assign the first slice
+    velocity_samples_laplace_jax = velocity_samples_laplace_jax.at[0:16].set(test[32:48])
+
+    # Interleave even and odd indices
+    even_indices = test[0:32:2]
+    odd_indices = test[1:32:2]
+    velocity_samples_laplace_jax = velocity_samples_laplace_jax.at[16:48].set(jnp.concatenate([even_indices, odd_indices], axis=0))
+
+    # Assign the next slice
+    velocity_samples_laplace_jax = velocity_samples_laplace_jax.at[48:64].set(test[304:320])
+
+    # Rearrange test[48:304]
+    num_rows = (304 - 48) // 16
+    indices = jnp.arange(num_rows * 16).reshape(16, num_rows).T.flatten()
+    velocity_samples_laplace_jax = velocity_samples_laplace_jax.at[64:320].set(test[48:304][indices])
+
+    # Assign test[352:354]
+    velocity_samples_laplace_jax = velocity_samples_laplace_jax.at[320:322].set(test[352:354])
+
+    # Rearrange test[320:352]
+    test_test = test[320:352]
+    indices_2 = jnp.arange(test_test.size).reshape(-1, 16).T.flatten()
+    velocity_samples_laplace_jax = velocity_samples_laplace_jax.at[322:354].set(test_test[indices_2])
+
+    return velocity_samples_laplace_jax
+
+
+# @profile
 def main(args):
     print("Linearization?")
     print(args.linearized_pred)
-    subset_of_weights = args.subset  # must be 'all'
-    hessian_structure = args.structure  #'full' # other possibility is 'diag' or 'full'
     n_posterior_samples = args.samples
     optimize_prior = args.optimize_prior
     print("Are we optimizing the prior? ", optimize_prior)
@@ -61,15 +82,9 @@ def main(args):
     batch_size_valid = 50
     batch_size_test = 50
 
-    train_loader = create_data_loader(
-        x_train, y_train, batch_size_train, rng, shuffle=True
-    )
-    valid_loader = create_data_loader(
-        x_valid, y_valid, batch_size_valid, rng, shuffle=False
-    )
-    test_loader = create_data_loader(
-        x_test, y_test, batch_size_test, rng, shuffle=False
-    )
+    train_loader = create_data_loader(x_train, y_train, batch_size_train, rng, shuffle=True)
+    valid_loader = create_data_loader(x_valid, y_valid, batch_size_valid, rng, shuffle=False)
+    test_loader = create_data_loader(x_test, y_test, batch_size_test, rng, shuffle=False)
 
     if args.optimizer == "sgd":
         learning_rate = 1e-3
@@ -99,9 +114,7 @@ def main(args):
         # Training step
         for batch_img, batch_label in train_loader:
             state = train_step(state, batch_img, batch_label)
-            train_loss += compute_loss(
-                state.apply_fn(state.params, batch_img), batch_label
-            )
+            train_loss += compute_loss(state.apply_fn(state.params, batch_img), batch_label)
         train_loss /= len(x_train)
 
         # Validation step
@@ -113,15 +126,11 @@ def main(args):
             val_pred = jnp.argmax(logits, axis=1)
             val_accuracy += jnp.sum(val_pred == val_label)  # Sum correct predictions
 
-        val_accuracy /= len(
-            x_valid
-        )  # Calculate accuracy as the fraction of correct predictions
+        val_accuracy /= len(x_valid)  # Calculate accuracy as the fraction of correct predictions
 
         # Print every 100 epochs
         if (epoch + 1) % 100 == 0:
-            print(
-                f"Epoch: {epoch + 1}, Train loss: {train_loss:.4f}, Val accuracy: {val_accuracy:.4f}"
-            )
+            print(f"Epoch: {epoch + 1}, Train loss: {train_loss:.4f}, Val accuracy: {val_accuracy:.4f}")
 
     def get_map_solution(state):
         map_solution, unravel_fn = jax.flatten_util.ravel_pytree(state.params)
@@ -140,18 +149,16 @@ def main(args):
     # Create grid using jnp.linspace and jnp.meshgrid
     x_grid = jnp.linspace(x1min, x1max, N_grid)
     y_grid = jnp.linspace(x2min, x2max, N_grid)
-    XX1, XX2 = jnp.meshgrid(
-        x_grid, y_grid, indexing="ij"
-    )  # Use 'ij' for matrix indexing
-    X_grid = jnp.column_stack((XX1.ravel(), XX2.ravel()))
+    grid_mesh_x, grid_mesh_y = jnp.meshgrid(x_grid, y_grid, indexing="ij")  # Use 'ij' for matrix indexing
+    grid_points = jnp.column_stack((grid_mesh_x.ravel(), grid_mesh_y.ravel()))
 
     # Computing and plotting the MAP confidence
-    logits_map = state.apply_fn(state.params, X_grid)  # Compute logits
+    logits_map = state.apply_fn(state.params, grid_points)  # Compute logits
     probs_map = jax.nn.softmax(logits_map)  # Apply softmax
 
     conf = probs_map.max(1)
 
-    plot_map_confidence(x_train, y_train, XX1, XX2, conf, title="Confidence MAP")
+    plot_map_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, conf, title="Confidence MAP")
 
     ## Quick import of pytorch model for the laplace package!
     model_torch = nn_torch.Sequential(
@@ -184,16 +191,14 @@ def main(args):
     x_torch_train = torch.from_numpy(np.array(x_train))
     y_torch_train = torch.from_numpy(np.array(y_train)).long()
     train_torch_dataset = torch.utils.data.TensorDataset(x_torch_train, y_torch_train)
-    train_torch_loader = torch.utils.data.DataLoader(
-        train_torch_dataset, batch_size=265, shuffle=True
-    )
+    train_torch_loader = torch.utils.data.DataLoader(train_torch_dataset, batch_size=265, shuffle=True)
 
     print("Fitting Laplace")
     la = Laplace(
         model_torch,
         "classification",
-        subset_of_weights=subset_of_weights,
-        hessian_structure=hessian_structure,
+        "all",
+        hessian_structure="full",  # we can also use "diag" for a possible speedup but its not significantly faster and less accurate
         prior_precision=2 * weight_decay,
     )
     la.fit(train_torch_loader)
@@ -209,120 +214,64 @@ def main(args):
     # and get some samples from it, our initial velocities
     # now I can get some samples for the Laplace approx
 
-    if hessian_structure == "diag":
-        samples = jax.random.normal(rng, shape=(n_posterior_samples, la.n_params))
-        samples = samples * t2j(la.posterior_scale.reshape(1, la.n_params))
-        V_LA = samples
+    # if hessian_structure == "diag":
+    #     samples = jax.random.normal(rng, shape=(n_posterior_samples, la.n_params))
+    #     samples = samples * t2j(la.posterior_scale.reshape(1, la.n_params))
+    #     velocity_samples_laplace = samples
 
-    else:
-        scale_tril = scale_tril = jnp.array(la.posterior_scale)
-        V_LA = jax.random.multivariate_normal(
-            rng,
-            mean=jnp.zeros_like(map_solution),
-            cov=scale_tril @ scale_tril.T,
-            shape=(n_posterior_samples,),
-        )
-        print(V_LA.shape)
-
-    @jax.jit
-    def rearrange_V_LA(test):
-        # Initialize the output array
-        V_LA_jax = jnp.zeros(354, dtype=test.dtype)
-
-        # Assign the first slice
-        V_LA_jax = V_LA_jax.at[0:16].set(test[32:48])
-
-        # Interleave even and odd indices
-        even_indices = test[0:32:2]
-        odd_indices = test[1:32:2]
-        V_LA_jax = V_LA_jax.at[16:48].set(
-            jnp.concatenate([even_indices, odd_indices], axis=0)
-        )
-
-        # Assign the next slice
-        V_LA_jax = V_LA_jax.at[48:64].set(test[304:320])
-
-        # Rearrange test[48:304]
-        num_rows = (304 - 48) // 16
-        indices = jnp.arange(num_rows * 16).reshape(16, num_rows).T.flatten()
-        V_LA_jax = V_LA_jax.at[64:320].set(test[48:304][indices])
-
-        # Assign test[352:354]
-        V_LA_jax = V_LA_jax.at[320:322].set(test[352:354])
-
-        # Rearrange test[320:352]
-        test_test = test[320:352]
-        indices_2 = jnp.arange(test_test.size).reshape(-1, 16).T.flatten()
-        V_LA_jax = V_LA_jax.at[322:354].set(test_test[indices_2])
-
-        return V_LA_jax
+    # else:
+    scale_tril = scale_tril = jnp.array(la.posterior_scale)
+    velocity_samples_laplace = jax.random.multivariate_normal(
+        rng,
+        mean=jnp.zeros_like(map_solution),
+        cov=scale_tril @ scale_tril.T,
+        shape=(n_posterior_samples,),
+    )
+    print(velocity_samples_laplace.shape)
 
     for n in range(n_posterior_samples):
-        V_LA = V_LA.at[n, :].set(rearrange_V_LA(V_LA[n, :]))
+        velocity_samples_laplace = velocity_samples_laplace.at[n, :].set(rearrange_velocity_samples_laplace(velocity_samples_laplace[n, :]))
 
     #  ok now I have the initial velocities. I can therefore consider my manifold
+    if optimize_prior:
+        lambda_reg = la.prior_precision.item() / 2
+    else:
+        lambda_reg = weight_decay
+
+    state_model_2 = create_train_state(rng, model, optimizer=optimizer)
+
     if args.linearized_pred:
         # here I have to first compute the f_MAP in both cases
         state = state.replace(params=unravel_fn(map_solution))
         f_MAP = state.apply_fn(state.params, x_train)
 
-        state_model_2 = create_train_state(rng, model, optimizer=optimizer)
-
-        ########### All the lines below will not work until we have converted LinearizedCrossEntropyManifold ####
-        if optimize_prior:
-            manifold = LinearizedCrossEntropyManifold(
-                model,
-                state_model_2,
-                x_train,
-                y_train,
-                f_MAP=f_MAP,
-                theta_MAP=map_solution,
-                unravel_fn=unravel_fn,
-                batching=False,
-                lambda_reg=la.prior_precision.item() / 2,
-            )
-        else:
-            manifold = LinearizedCrossEntropyManifold(
-                model,
-                state_model_2,
-                x_train,
-                y_train,
-                f_MAP=f_MAP,
-                theta_MAP=map_solution,
-                unravel_fn=unravel_fn,
-                batching=False,
-                lambda_reg=weight_decay,
-            )
+        manifold = LinearizedCrossEntropyManifold(
+            model,
+            state_model_2,
+            x_train,
+            y_train,
+            f_MAP=f_MAP,
+            theta_MAP=map_solution,
+            unravel_fn=unravel_fn,
+            batching=False,
+            lambda_reg=lambda_reg,
+        )
     else:
         # here we have the usual manifold
-        state_model_2 = create_train_state(rng, model, optimizer=optimizer)
-
-        # here depending if I am using a diagonal approx, I have to redefine the model
-        if optimize_prior:
-            manifold = CrossEntropyManifold(
-                model,
-                state_model_2,
-                x_train,
-                y_train,
-                unravel_fn=unravel_fn,
-                batching=False,
-                lambda_reg=la.prior_precision.item() / 2,
-            )
-        else:
-            manifold = CrossEntropyManifold(
-                model,
-                state_model_2,
-                x_train,
-                y_train,
-                unravel_fn=unravel_fn,
-                batching=False,
-                lambda_reg=weight_decay,
-            )
+        manifold = CrossEntropyManifold(
+            model,
+            state_model_2,
+            x_train,
+            y_train,
+            unravel_fn=unravel_fn,
+            batching=False,
+            lambda_reg=lambda_reg,
+        )
 
     # now i have my manifold and so I can solve the expmap
     weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
     for n in tqdm(range(n_posterior_samples), desc="Solving expmap"):
-        v = V_LA[n, :].reshape(-1, 1)
+        v = velocity_samples_laplace[n, :].reshape(-1, 1)
         curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
         _new_weights = curve(1)[0]
         weights_ours = weights_ours.at[n, :].set(jnp.array(_new_weights.reshape(-1)))
@@ -330,15 +279,15 @@ def main(args):
     # now I can use my weights for prediction. Deoending if I am using linearization or not the prediction looks differently
     if args.linearized_pred:
         state_model_2 = state_model_2.replace(params=unravel_fn(map_solution))
-        f_MAP_grid = state_model_2.apply_fn(state_model_2.params, X_grid)
+        f_MAP_grid = state_model_2.apply_fn(state_model_2.params, grid_points)
         f_MAP_test = state_model_2.apply_fn(state_model_2.params, x_test)
 
         def predict(params, datas):
             y_pred = state_model_2.apply_fn(params, datas)
             return y_pred
 
-        P_grid_OURS_lin = 0
-        P_test_OURS = 0
+        linearized_grid_posterior_probabilities = 0
+        test_posterior_probabilities = 0
 
         # now I can do the same for our method
         for n in range(n_posterior_samples):
@@ -351,24 +300,26 @@ def main(args):
             diff_as_params = unravel_fn(diff_weights)
 
             _, jvp_value_grid = jax.jvp(
-                predict, (params, X_grid), (diff_as_params, jnp.zeros_like(X_grid))
+                predict,
+                (params, grid_points),
+                (diff_as_params, jnp.zeros_like(grid_points)),
             )
 
             f_OUR_grid = f_MAP_grid + jvp_value_grid
 
             probs_grid = jax.nn.softmax(f_OUR_grid, axis=1)
-            P_grid_OURS_lin += probs_grid
+            linearized_grid_posterior_probabilities += probs_grid
 
-        P_grid_OURS_lin /= n_posterior_samples
-        P_grid_OUR_conf = P_grid_OURS_lin.max(1)
+        linearized_grid_posterior_probabilities /= n_posterior_samples
+        grid_posterior_confidence = linearized_grid_posterior_probabilities.max(1)
 
         plot_ours_confidence(
             x_train,
             y_train,
-            XX1,
-            XX2,
-            P_grid_OUR_conf,
-            P_grid_OURS_lin[:, 0],
+            grid_mesh_x,
+            grid_mesh_y,
+            grid_posterior_confidence,
+            linearized_grid_posterior_probabilities[:, 0],
             title="Confidence OURS linearized",
         )
 
@@ -382,56 +333,57 @@ def main(args):
 
             diff_as_params = unravel_fn(diff_weights)
 
-            _, jvp_value_test = jax.jvp(
-                predict, (params, x_test), (diff_as_params, jnp.zeros_like(x_test))
-            )
+            _, jvp_value_test = jax.jvp(predict, (params, x_test), (diff_as_params, jnp.zeros_like(x_test)))
 
             f_OUR_test = f_MAP_test + jvp_value_test
 
             probs_test = jax.nn.softmax(f_OUR_test, axis=1)
-            P_test_OURS += probs_test
+            test_posterior_probabilities += probs_test
 
     else:
         # and then our stuff
-        P_grid_OUR = 0
+        grid_posterior_probabilities = 0
         for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
             state = state.replace(params=unravel_fn(weights_ours[n, :]))
             # compute the predictions
-            P_grid_OUR += jax.nn.softmax(state.apply_fn(state.params, X_grid), axis=1)
+            grid_posterior_probabilities += jax.nn.softmax(state.apply_fn(state.params, grid_points), axis=1)
 
-        P_grid_OUR /= n_posterior_samples
-        P_grid_OUR_conf = P_grid_OUR.max(1)
+        grid_posterior_probabilities /= n_posterior_samples
+        grid_posterior_confidence = grid_posterior_probabilities.max(1)
 
         plot_ours_confidence(
             x_train,
             y_train,
-            XX1,
-            XX2,
-            P_grid_OUR_conf,
-            P_grid_OUR[:, 0],
+            grid_mesh_x,
+            grid_mesh_y,
+            grid_posterior_confidence,
+            grid_posterior_probabilities[:, 0],
             title="Confidence OURS",
         )
 
-        P_test_OURS = 0
+        test_posterior_probabilities = 0
         for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
             # put the weights in the model
             state = state.replace(params=unravel_fn(weights_ours[n, :]))
             # compute the predictions
-            P_test_OURS += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
+            test_posterior_probabilities += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
 
     # I can compute and plot the results
 
-    P_test_OURS /= n_posterior_samples
+    test_posterior_probabilities /= n_posterior_samples
 
-    accuracy_OURS = accuracy(P_test_OURS, y_test)
-    nll_OUR = nll(P_test_OURS, y_test)
-    brier_OURS = brier(P_test_OURS, y_test)
+    accuracy_posterior = accuracy(test_posterior_probabilities, y_test)
+    negative_log_likelihood = nll(test_posterior_probabilities, y_test)
+    brier_score = brier(test_posterior_probabilities, y_test)
 
-    ece_our = (
+    test_posterior_probabilities_torch = torch.from_numpy(np.array(test_posterior_probabilities))
+    y_test_torch = torch.from_numpy(np.array(y_test))
+
+    ece = (
         calibration_error(
-            torch.from_numpy(np.array(P_test_OURS)),
-            torch.from_numpy(np.array(y_test)),
+            test_posterior_probabilities_torch,
+            y_test_torch,
             norm="l1",
             task="multiclass",
             num_classes=2,
@@ -439,10 +391,11 @@ def main(args):
         )
         * 100
     )
-    mce_our = (
+
+    mce = (
         calibration_error(
-            torch.from_numpy(np.array(P_test_OURS)),
-            torch.from_numpy(np.array(y_test)),
+            test_posterior_probabilities_torch,
+            y_test_torch,
             norm="max",
             task="multiclass",
             num_classes=2,
@@ -450,18 +403,15 @@ def main(args):
         )
         * 100
     )
-    # ece_our = calibration_error(P_test_OURS, y_test, norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
-    # mce_our = calibration_error(P_test_OURS, y_test, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
 
-    print(
-        f"Results OURS: accuracy {accuracy_OURS}, nll {nll_OUR}, brier {brier_OURS}, ECE {ece_our}, MCE {mce_our}"
-    )
+    # ece = calibration_error(test_posterior_probabilities, y_test, norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
+    # mce = calibration_error(test_posterior_probabilities, y_test, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
+
+    print(f"Results: accuracy {accuracy_posterior}, nll {negative_log_likelihood}, brier {brier_score}, ECE {ece}, MCE {mce}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Geomeatric Approximate Inference (GEOMAI)"
-    )
+    parser = argparse.ArgumentParser(description="Geomeatric Approximate Inference (GEOMAI)")
     parser.add_argument("--seed", "-s", type=int, default=230, help="seed")
     parser.add_argument(
         "--optimizer",
@@ -477,36 +427,13 @@ if __name__ == "__main__":
         default=False,
         help="optimize prior",
     )
-    parser.add_argument(
-        "--structure",
-        "-str",
-        type=str,
-        default="full",
-        help="Hessian struct for Laplace",
-    )
-    parser.add_argument(
-        "--subset",
-        "-sub",
-        type=str,
-        default="all",
-        help="subset of weights for Laplace",
-    )
-    parser.add_argument(
-        "--samples", "-samp", type=int, default=50, help="number of posterior samples"
-    )
+    parser.add_argument("--samples", "-samp", type=int, default=50, help="number of posterior samples")
     parser.add_argument(
         "--linearized_pred",
         "-lin",
         type=bool,
         default=False,
         help="Linearization for prediction",
-    )
-    parser.add_argument(
-        "--test_all",
-        "-test_all",
-        type=bool,
-        default=False,
-        help="Use also the validation set that we are not using for evaluation",
     )
 
     args = parser.parse_args()
