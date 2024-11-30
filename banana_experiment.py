@@ -59,7 +59,7 @@ def rearrange_velocity_samples_laplace(test):
     return velocity_samples_laplace_jax
 
 
-# @profile
+@profile
 def main(args):
     print("Linearization?")
     print(args.linearized_pred)
@@ -79,12 +79,8 @@ def main(args):
 
     # Create data loaders
     batch_size_train = 256
-    batch_size_valid = 50
-    batch_size_test = 50
 
     train_loader = create_data_loader(x_train, y_train, batch_size_train, rng, shuffle=True)
-    valid_loader = create_data_loader(x_valid, y_valid, batch_size_valid, rng, shuffle=False)
-    test_loader = create_data_loader(x_test, y_test, batch_size_test, rng, shuffle=False)
 
     if args.optimizer == "sgd":
         learning_rate = 1e-3
@@ -118,15 +114,9 @@ def main(args):
         train_loss /= len(x_train)
 
         # Validation step
-        val_loss = 0
-        val_accuracy = 0
-
-        for val_img, val_label in valid_loader:
-            logits = state.apply_fn(state.params, val_img)
-            val_pred = jnp.argmax(logits, axis=1)
-            val_accuracy += jnp.sum(val_pred == val_label)  # Sum correct predictions
-
-        val_accuracy /= len(x_valid)  # Calculate accuracy as the fraction of correct predictions
+        logits = state.apply_fn(state.params, x_valid)
+        val_pred = jnp.argmax(logits, axis=1)
+        val_accuracy = jnp.mean(val_pred == y_valid)
 
         # Print every 100 epochs
         if (epoch + 1) % 100 == 0:
