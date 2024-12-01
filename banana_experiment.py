@@ -321,7 +321,36 @@ def main(args):
             title="Confidence OURS linearized",
         )
 
-        # now I can do the same for our method
+        P_grid_laplace_lin = 0
+        P_test_laplace = 0
+
+        ## Now we seek to compute the baseline laplace
+        for n in range(n_posterior_samples):
+            weights_laplace = velocity_samples_laplace[n, :]
+            state_model_2 = state_model_2.replace(params=unravel_fn(map_solution))
+            diff_as_params = unravel_fn(weights_laplace)
+            _, jvp_value_grid = jax.jvp(
+                predict,
+                (params, grid_points),
+                (diff_as_params, jnp.zeros_like(grid_points)),
+            )
+            f_laplace_grid = f_MAP_grid + jvp_value_grid
+            probs_grid_laplace = jax.nn.softmax(f_laplace_grid, axis=1)
+            P_grid_laplace_lin += probs_grid_laplace
+        P_grid_laplace_lin /= n_posterior_samples
+        P_grid_laplace_conf = P_grid_laplace_lin.max(1)
+
+        plot_ours_confidence(
+            x_train,
+            y_train,
+            grid_mesh_x,
+            grid_mesh_y,
+            P_grid_laplace_conf,
+            P_grid_laplace_lin[:, 0],
+            title="Confidence LAPLACE linearized",
+        )
+
+        ## Now consider the test set:
         for n in range(n_posterior_samples):
             # get the theta weights we are interested in #
             w_OUR = weights_ours[n, :]
@@ -338,10 +367,22 @@ def main(args):
             probs_test = jax.nn.softmax(f_OUR_test, axis=1)
             test_posterior_probabilities += probs_test
 
+        for n in range(n_posterior_samples):
+            weights_laplace = velocity_samples_laplace[n, :]
+            state_model_2 = state_model_2.replace(params=unravel_fn(map_solution))
+            params = unravel_fn(map_solution)
+            diff_as_params = unravel_fn(weights_laplace)
+            _, jvp_value_test = jax.jvp(predict, (params, x_test), (diff_as_params, jnp.zeros_like(x_test)))
+
+            f_laplace_test = f_MAP_test + jvp_value_test
+            probs_test_laplace = jax.nn.softmax(f_laplace_test, axis=1)
+            P_test_laplace += probs_test_laplace
+
+
     else:
         # and then our stuff
         grid_posterior_probabilities = 0
-        for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
+        for n in range(n_posterior_samples):
             # put the weights in the model
             state = state.replace(params=unravel_fn(weights_ours[n, :]))
             # compute the predictions
@@ -361,15 +402,47 @@ def main(args):
         )
 
         test_posterior_probabilities = 0
-        for n in tqdm(range(n_posterior_samples), desc="computing laplace samples"):
+        for n in range(n_posterior_samples):
             # put the weights in the model
             state = state.replace(params=unravel_fn(weights_ours[n, :]))
             # compute the predictions
             test_posterior_probabilities += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
 
+   
+        # and then laplace stuff
+        grid_posterior_probabilities_la = 0
+        for n in range(n_posterior_samples):
+            laplace_weights = velocity_samples_laplace[n,:] + map_solution
+            # put the weights in the model
+            state = state.replace(params=unravel_fn(laplace_weights))
+            # compute the predictions
+            grid_posterior_probabilities_la += jax.nn.softmax(state.apply_fn(state.params, grid_points), axis=1)
+
+        grid_posterior_probabilities_la /= n_posterior_samples
+        grid_posterior_confidence_la = grid_posterior_probabilities_la.max(1)
+
+        plot_ours_confidence(
+            x_train,
+            y_train,
+            grid_mesh_x,
+            grid_mesh_y,
+            grid_posterior_confidence_la,
+            grid_posterior_probabilities_la[:, 0],
+            title="Confidence LAPLACE",
+        )
+
+        P_test_laplace = 0
+        for n in range(n_posterior_samples):
+            laplace_weights = velocity_samples_laplace[n,:] + map_solution
+            # put the weights in the model
+            state = state.replace(params=unravel_fn(laplace_weights))
+            # compute the predictions
+            P_test_laplace += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
+
     # I can compute and plot the results
 
     test_posterior_probabilities /= n_posterior_samples
+    P_test_laplace /= n_posterior_samples
 
     accuracy_posterior = accuracy(test_posterior_probabilities, y_test)
     negative_log_likelihood = nll(test_posterior_probabilities, y_test)
@@ -402,6 +475,35 @@ def main(args):
         * 100
     )
 
+    accuracy_laplace = accuracy(P_test_laplace, y_test)
+    nll_laplace = nll(P_test_laplace, y_test)
+    brier_score_laplace = brier(P_test_laplace, y_test)
+
+    P_test_laplace_torch = torch.from_numpy(np.array(P_test_laplace))
+    ece_laplace = (
+        calibration_error(
+            P_test_laplace_torch,
+            y_test_torch,
+            norm="l1",
+            task="multiclass",
+            num_classes=2,
+            n_bins=10,
+        )
+        * 100
+    )
+
+    mce_laplace = (
+        calibration_error(
+            P_test_laplace_torch,
+            y_test_torch,
+            norm="max",
+            task="multiclass",
+            num_classes=2,
+            n_bins=10,
+        )
+        * 100
+    )
+
     # ece = calibration_error(test_posterior_probabilities, y_test, norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
     # mce = calibration_error(test_posterior_probabilities, y_test, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
 
@@ -417,7 +519,8 @@ def main(args):
     mce_map = calibration_error(MAP_probs_torch, y_test_torch, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
 
     print(f"Results MAP: accuracy {accuracy_MAP}, nll {nll_MAP}, brier {brier_MAP}, ECE {ece_map}, MCE {mce_map}")
-    print(f"Results: accuracy {accuracy_posterior}, nll {negative_log_likelihood}, brier {brier_score}, ECE {ece}, MCE {mce}")
+    print(f"Results RIEM LA: accuracy {accuracy_posterior}, nll {negative_log_likelihood}, brier {brier_score}, ECE {ece}, MCE {mce}")
+    print(f"Results LA: accuracy {accuracy_laplace}, nll {nll_laplace}, brier {brier_score_laplace}, ECE {ece_laplace}, MCE {mce_laplace}")
 
 
 if __name__ == "__main__":
