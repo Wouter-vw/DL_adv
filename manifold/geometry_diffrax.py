@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import diffrax
+from functools import partial
 
 # Note: JAX doesn't have direct equivalents for some SciPy functions like `solve_ivp` or `integrate.quad`.
 # We'll use JAX's `odeint` for ODE solving and approximate integrals numerically.
@@ -8,47 +9,9 @@ import diffrax
 jax.config.update("jax_enable_x64", True)
 
 
-# This function evaluates the differential equation c'' = f(c, c')
-def geodesic_system(manifold, c, dc):
-    # Input: c, dc (D x N)
-    D, N = c.shape
-    if dc.shape != c.shape:
-        raise ValueError("c and dc must have the same shape.")
-
-    # Evaluate the metric and its derivative
-    M, dM = manifold.metric_tensor(c, nargout=2)
-
-    # Prepare the output (D x N)
-    ddc = jnp.zeros((D, N))
-
-    # Diagonal Metric Case
-    if manifold.is_diagonal():
-        for n in range(N):
-            dMn = jnp.squeeze(dM[n, :, :])
-            numerator = -0.5 * (
-                2 * (dMn * dc[:, n].reshape(-1, 1)) @ dc[:, n] - dMn.T @ (dc[:, n] ** 2)
-            )
-            ddc = ddc.at[:, n].set(numerator.flatten() / M[n, :])
-    else:
-        M_inv = jnp.linalg.inv(M)  # N x D x D
-        Term1 = dM.reshape(N, D, D * D, order="F")  # N x D x D^2
-        Term2 = dM.reshape(N, D * D, D, order="F")  # N x D^2 x D
-
-        for n in range(N):
-            numerator = (
-                -0.5
-                * M_inv[n, :, :]
-                @ (
-                    (2 * Term1[n, :, :] - Term2[n, :, :].T)
-                    @ jnp.kron(dc[:, n], dc[:, n])
-                )
-            )
-            ddc = ddc.at[:, n].set(numerator)
-    return ddc
-
-
 # This function changes the 2nd order ODE to two 1st order ODEs
-def second2first_order(manifold, state, subset_of_weights):
+@partial(jax.jit, static_argnums=(0))
+def second2first_order(manifold, state):
     D = int(state.shape[0] / 2)
 
     if state.ndim == 1:
@@ -56,20 +19,16 @@ def second2first_order(manifold, state, subset_of_weights):
 
     c = state[:D, :]  # D x N
     cm = state[D:, :]  # D x N
-    if subset_of_weights == "last_layer":
-        # For the last layer, use the existing implementation
-        cmm = geodesic_system(manifold, c, cm)  # D x N
-    else:
-        # For the full network, use the hvp implementation
-        cmm = manifold.geodesic_system(c, cm)
+
+    cmm = manifold.geodesic_system(c, cm)
     y = jnp.concatenate((cm.squeeze(), cmm.squeeze()), axis=0)
-    return y
+    return y.reshape(-1)
 
 
 # If the ODE solver succeeded, provide the solution
 def evaluate_solution(solution, t, t_scale):
     # Input: t (Tx0), t_scale is used to scale the curve to have correct length
-    c_dc = solution.ys[1]
+    c_dc = solution.ys[-1]
     D = int(c_dc.shape[0] / 2)
 
     if jnp.size(t) == 1:
@@ -82,11 +41,7 @@ def evaluate_solution(solution, t, t_scale):
 
 
 # This function implements the exponential map
-def expmap(manifold, x, v, subset_of_weights="all"):
-    assert subset_of_weights in [
-        "all",
-        "last_layer",
-    ], "subset_of_weights must be all or last_layer"
+def expmap(manifold, x, v,):
 
     # Input: v, x (D x 1)
     x = x.reshape(-1, 1)
@@ -95,24 +50,24 @@ def expmap(manifold, x, v, subset_of_weights="all"):
 
     # The solver needs the function in a specific format
     ode_fun = lambda t, c_dc, args: second2first_order(
-        manifold, c_dc, subset_of_weights
+        manifold, c_dc
     ).flatten()
 
-    if jnp.linalg.norm(v) > 1e-5:
-        curve, failed = new_solve_expmap(manifold, x, v, ode_fun, subset_of_weights)
-    else:
-        curve = lambda t: (
-            x.reshape(D, 1).repeat(t.size, axis=1),
-            v.reshape(D, 1).repeat(t.size, axis=1),
-        )  # Return tuple (2D x T)
-        failed = True
+    #if jnp.linalg.norm(v) > 1e-5:
+    curve, failed = new_solve_expmap(manifold, x, v, ode_fun)
+    # else:
+    #     curve = lambda t: (
+    #         x.reshape(D, 1).repeat(t.size, axis=1),
+    #         v.reshape(D, 1).repeat(t.size, axis=1),
+    #     )  # Return tuple (2D x T)
+    #     failed = True
 
     return curve, failed
 
 
 # This function solves the initial value problem for the implementation of the expmap
 # @partial(jax.jit, static_argnums=(0,3))
-def new_solve_expmap(manifold, x, v, ode_fun, subset_of_weights):
+def new_solve_expmap(manifold, x, v, ode_fun):
     D = x.shape[0]
 
     # Ensure inputs are JAX arrays
