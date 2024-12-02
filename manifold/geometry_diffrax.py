@@ -21,7 +21,7 @@ def second2first_order(manifold, state):
 
 # Function to evaluate the solution
 def evaluate_solution(solution, t, t_scale):
-    c_dc = solution.ys[-1]
+    c_dc = solution.ys[t]
     D = int(c_dc.shape[0] / 2)
 
     c = c_dc[:D].reshape(D, 1)
@@ -41,8 +41,8 @@ def expmap(manifold, x, v):
     
     init = jnp.concatenate((x, v), axis=0).flatten()
     term = diffrax.ODETerm(ode_fun)
-    solver = diffrax.Dopri5()
-    stepsize_controller = diffrax.PIDController(rtol=1e-6, atol=1e-3)
+    solver = diffrax.Tsit5()
+    stepsize_controller = diffrax.PIDController(pcoeff=0.0, icoeff=1.0, dcoeff=0.0, rtol=1e-6, atol=1e-3)
 
     y0 = init
     
@@ -51,11 +51,11 @@ def expmap(manifold, x, v):
         solver,
         t0=0.0,
         t1=1.0,
-        dt0=1.0,
+        dt0=0.2,
         y0=y0,
         saveat=diffrax.SaveAt(t1 = True),
         stepsize_controller=stepsize_controller,
     )
 
-    final_c, final_dc = evaluate_solution(sol, 1.0, 1.0)
+    final_c, final_dc = evaluate_solution(sol, 1, 1.0)
     return final_c, final_dc, False
