@@ -26,7 +26,7 @@ warnings.filterwarnings(
 
 #####################################
 
-import manifold.geometry as geometry
+import manifold.geometry_diffrax as geometry
 from manifold.manifold_kfac import CrossEntropyManifold, LinearizedCrossEntropyManifold
 from utils.data_loading import create_data_loader, load_banana_data
 from utils.evaluation import accuracy, brier, nll
@@ -270,8 +270,16 @@ def main(args):
     weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
     for n in tqdm(range(n_posterior_samples), desc="Solving expmap"):
         v = velocity_samples_laplace[n, :].reshape(-1, 1)
-        curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
-        _new_weights = curve(1)[0]
+        
+        ### This is for geometry not DIFFRAX!    
+        #curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
+        #_new_weights = curve(1)[0]
+
+#################################################################################
+        final_c, _, failed = geometry.expmap(manifold, map_solution.clone(), v)
+        _new_weights = final_c
+###################################################################################
+
         weights_ours = weights_ours.at[n, :].set(jnp.array(_new_weights.reshape(-1)))
 
     # now I can use my weights for prediction. Deoending if I am using linearization or not the prediction looks differently
