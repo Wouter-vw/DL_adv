@@ -26,7 +26,8 @@ warnings.filterwarnings(
 
 #####################################
 
-import manifold.geometry_diffrax as geometry
+import manifold.geometry_diffrax as geometry_diffrax
+import manifold.geometry as geometry
 from manifold.manifold_kfac import CrossEntropyManifold, LinearizedCrossEntropyManifold
 from utils.data_loading import create_data_loader, load_banana_data
 from utils.evaluation import accuracy, brier, nll
@@ -69,18 +70,15 @@ def rearrange_velocity_samples_laplace(test):
 
 
 def main(args):
-    print("Linearization?")
-    print(args.linearized_pred)
+    print(f"Input Flags: Seed: {args.seed}, Linearization? {args.linearized_pred}, # Posterior Samples: {args.samples}, Prior Optimization? {args.optimize_prior}, Optimizer: {args.optimizer}, Diffrax? {args.diffrax}")
     n_posterior_samples = args.samples
     optimize_prior = args.optimize_prior
-    print("Are we optimizing the prior? ", optimize_prior)
 
     # run with several seeds
     seed = args.seed
     jrandom.PRNGKey(seed)
     rng = jrandom.PRNGKey(seed)
     torch.manual_seed(seed)
-    print("Seed: ", seed)
 
     # Load the banana dataset
     x_train, x_valid, x_test, y_train, y_valid, y_test = load_banana_data()
@@ -270,16 +268,12 @@ def main(args):
     weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
     for n in tqdm(range(n_posterior_samples), desc="Solving expmap"):
         v = velocity_samples_laplace[n, :].reshape(-1, 1)
-        
-        ### This is for geometry not DIFFRAX!    
-        #curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
-        #_new_weights = curve(1)[0]
-
-#################################################################################
-        final_c, _, failed = geometry.expmap(manifold, map_solution.clone(), v)
-        _new_weights = final_c
-###################################################################################
-
+        if args.diffrax:
+            final_c, _, failed = geometry_diffrax.expmap(manifold, map_solution.clone(), v)
+            _new_weights = final_c
+        else:
+            curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
+            _new_weights = curve(1)[0]
         weights_ours = weights_ours.at[n, :].set(jnp.array(_new_weights.reshape(-1)))
 
     # now I can use my weights for prediction. Deoending if I am using linearization or not the prediction looks differently
@@ -326,7 +320,7 @@ def main(args):
             grid_mesh_y,
             grid_posterior_confidence,
             linearized_grid_posterior_probabilities[:, 0],
-            title="Confidence OURS linearized",
+            title="Confidence RIEM LA linearized",
         )
 
         P_grid_laplace_lin = 0
@@ -406,7 +400,7 @@ def main(args):
             grid_mesh_y,
             grid_posterior_confidence,
             grid_posterior_probabilities[:, 0],
-            title="Confidence OURS",
+            title="Confidence RIEM LA",
         )
 
         test_posterior_probabilities = 0
@@ -539,7 +533,7 @@ if __name__ == "__main__":
         "-optim",
         type=str,
         default="sgd",
-        help="otpimizer used to train the model",
+        help="optimizer used to train the model",
     )
     parser.add_argument(
         "--optimize_prior",
@@ -556,6 +550,7 @@ if __name__ == "__main__":
         default=False,
         help="Linearization for prediction",
     )
+    parser.add_argument("--diffrax", "-diffrax", type=bool, default=False, help="Solve with diffrax instead of scipy")
 
     args = parser.parse_args()
     main(args)

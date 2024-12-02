@@ -1,4 +1,3 @@
-import time
 import jax
 import jax.numpy as jnp
 import diffrax
@@ -25,12 +24,8 @@ def evaluate_solution(solution, t, t_scale):
     c_dc = solution.ys[-1]
     D = int(c_dc.shape[0] / 2)
 
-    if jnp.size(t) == 1:
-        c = c_dc[:D].reshape(D, 1)
-        dc = c_dc[D:].reshape(D, 1) * t_scale
-    else:
-        c = c_dc[:D, :]  # D x T
-        dc = c_dc[D:, :] * t_scale  # D x T
+    c = c_dc[:D].reshape(D, 1)
+    dc = c_dc[D:].reshape(D, 1) * t_scale
     return c, dc
 
 # Function to compute the exponential map
@@ -50,7 +45,6 @@ def expmap(manifold, x, v):
     stepsize_controller = diffrax.PIDController(rtol=1e-6, atol=1e-3)
 
     y0 = init
-    saveat = diffrax.SaveAt(t1 = True)
     
     sol = diffrax.diffeqsolve(
         term,
