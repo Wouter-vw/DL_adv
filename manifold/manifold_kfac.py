@@ -7,7 +7,7 @@ import time
 jax.config.update("jax_enable_x64", True)
 
 
-class LinearizedCrossEntropyManifold:
+class LinearizedCrossEntropyManifold_kfac:
     """
     Also in this case I have to separate data fitting term and regularization term for gradient and
     hessian computation in case of batches.
@@ -153,7 +153,7 @@ class LinearizedCrossEntropyManifold:
         data = (self.input_data, self.target_labels)
 
         # let's start by putting the current points into the neural_network
-        model_state = self.model_state.replace(params=self.unravel_fn(current_point))
+        self.model_state = self.model_state.replace(params=self.unravel_fn(current_point))
 
         # now I have everything to compute the the second derivative
         # let's compute the gradient
@@ -183,7 +183,7 @@ class LinearizedCrossEntropyManifold:
         start = time.time()
         hvp_data_fitting = 0
         _, intermediates = self.neural_network.apply(
-            model_state.params, data[0], mutable=["intermediates"]
+            self.model_state.params, data[0], mutable=["intermediates"]
         )
         hvp_data_fitting = self.compute_kfac_hvp(
             intermediates, data_term_gradient, velocity_tree, num_layers=3
@@ -209,7 +209,7 @@ class LinearizedCrossEntropyManifold:
             return second_derivative.reshape(-1, 1)
 
 
-class CrossEntropyManifold:
+class CrossEntropyManifold_kfac:
     """
     Also in this case I have to split the gradient loss computation and the gradient of the regularization
     term.
@@ -339,7 +339,7 @@ class CrossEntropyManifold:
         data = (self.input_data, self.target_labels)
 
         # let's start by putting the current points into the neural_network
-        model_state = self.model_state.replace(params=self.unravel_fn(current_point))
+        self.model_state = self.model_state.replace(params=self.unravel_fn(current_point))
 
         # now I have everything to compute the the second derivative
         # let's compute the gradient
@@ -369,7 +369,7 @@ class CrossEntropyManifold:
         start = time.time()
         hvp_data_fitting = 0
         _, intermediates = self.neural_network.apply(
-            model_state.params, data[0], mutable=["intermediates"]
+            self.model_state.params, data[0], mutable=["intermediates"]
         )
         hvp_data_fitting = self.compute_kfac_hvp(
             intermediates, data_term_gradient, velocity_tree, num_layers=3

@@ -3,7 +3,7 @@ File containing the banana experiments
 """
 
 import argparse
-
+import os
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -28,11 +28,12 @@ warnings.filterwarnings(
 
 import manifold.geometry_diffrax as geometry_diffrax
 import manifold.geometry as geometry
-from manifold.manifold_kfac import CrossEntropyManifold, LinearizedCrossEntropyManifold
+from manifold.manifold_kfac import CrossEntropyManifold_kfac, LinearizedCrossEntropyManifold_kfac
+from manifold.manifold import CrossEntropyManifold, LinearizedCrossEntropyManifold
 from utils.data_loading import create_data_loader, load_banana_data
 from utils.evaluation import accuracy, brier, nll
 from utils.neural_network import MLP, compute_loss, create_train_state, train_step
-from utils.plots import plot_map_confidence, plot_ours_confidence
+from utils.plots import plot_map_confidence, plot_confidence
 
 jax.config.update("jax_enable_x64", True)
 
@@ -70,7 +71,7 @@ def rearrange_velocity_samples_laplace(test):
 
 
 def main(args):
-    print(f"Input Flags: Seed: {args.seed}, Linearization? {args.linearized_pred}, # Posterior Samples: {args.samples}, Prior Optimization? {args.optimize_prior}, Optimizer: {args.optimizer}, Diffrax? {args.diffrax}")
+    print(f"Input Flags: Seed: {args.seed}, Linearization? {args.linearized_pred}, # Posterior Samples: {args.samples}, Prior Optimization? {args.optimize_prior}, Optimizer: {args.optimizer}, KFAC? {args.kfac}, Diffrax? {args.diffrax}")
     n_posterior_samples = args.samples
     optimize_prior = args.optimize_prior
 
@@ -80,6 +81,12 @@ def main(args):
     rng = jrandom.PRNGKey(seed)
     torch.manual_seed(seed)
 
+    if args.savefig:
+        savepath = f"plots_seed_{args.seed}_linearized_{args.linearized_pred}_samples_{args.samples}_optimize_prior_{args.optimize_prior}_optimizer_{args.optimizer}_diffrax_{args.diffrax}"
+        ## Create a folder to save the plots
+        if not os.path.exists("plots"):
+            os.makedirs(savepath)
+    
     # Load the banana dataset
     x_train, x_valid, x_test, y_train, y_valid, y_test = load_banana_data()
 
@@ -154,7 +161,10 @@ def main(args):
 
     conf = probs_map.max(1)
 
-    plot_map_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, conf, title="Confidence MAP")
+    if args.savefig:
+        plot_map_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, conf, title="Confidence MAP", save_path=f"{savepath}/MAP.pdf")
+    else:
+        plot_map_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, conf, title="Confidence MAP")
 
     ## Quick import of pytorch model for the laplace package!
     model_torch = nn_torch.Sequential(
@@ -205,17 +215,6 @@ def main(args):
     print("Prior precision we are using")
     print(la.prior_precision)
 
-    ## Rewritten to use jax where possible, from now on
-    ## we seek to only use jax if we don't need external packages
-    # and get some samples from it, our initial velocities
-    # now I can get some samples for the Laplace approx
-
-    # if hessian_structure == "diag":
-    #     samples = jax.random.normal(rng, shape=(n_posterior_samples, la.n_params))
-    #     samples = samples * t2j(la.posterior_scale.reshape(1, la.n_params))
-    #     velocity_samples_laplace = samples
-
-    # else:
     scale_tril = jnp.array(la.posterior_scale)
     velocity_samples_laplace = jax.random.multivariate_normal(
         rng,
@@ -236,33 +235,60 @@ def main(args):
 
     state_model_2 = create_train_state(rng, model, optimizer=optimizer)
 
-    if args.linearized_pred:
-        # here I have to first compute the f_MAP in both cases
-        state = state.replace(params=unravel_fn(map_solution))
-        f_MAP = state.apply_fn(state.params, x_train)
+    if args.kfac:
+        if args.linearized_pred:
+            # here I have to first compute the f_MAP in both cases
+            state = state.replace(params=unravel_fn(map_solution))
+            f_MAP = state.apply_fn(state.params, x_train)
 
-        manifold = LinearizedCrossEntropyManifold(
-            model,
-            state_model_2,
-            x_train,
-            y_train,
-            f_MAP=f_MAP,
-            theta_MAP=map_solution,
-            unravel_fn=unravel_fn,
-            batching=False,
-            lambda_reg=lambda_reg,
-        )
+            manifold = LinearizedCrossEntropyManifold_kfac(
+                model,
+                state_model_2,
+                x_train,
+                y_train,
+                f_MAP=f_MAP,
+                theta_MAP=map_solution,
+                unravel_fn=unravel_fn,
+                batching=False,
+                lambda_reg=lambda_reg,
+            )
+        else:
+            # here we have the usual manifold
+            manifold = CrossEntropyManifold_kfac(
+                model,
+                state_model_2,
+                x_train,
+                y_train,
+                unravel_fn=unravel_fn,
+                batching=False,
+                lambda_reg=lambda_reg,
+            )
     else:
-        # here we have the usual manifold
-        manifold = CrossEntropyManifold(
-            model,
-            state_model_2,
-            x_train,
-            y_train,
-            unravel_fn=unravel_fn,
-            batching=False,
-            lambda_reg=lambda_reg,
-        )
+        if args.linearized_pred:
+            # here I have to first compute the f_MAP in both cases
+            state = state.replace(params=unravel_fn(map_solution))
+            f_MAP = state.apply_fn(state.params, x_train)
+
+            manifold = LinearizedCrossEntropyManifold(
+                state_model_2,
+                x_train,
+                y_train,
+                f_MAP=f_MAP,
+                theta_MAP=map_solution,
+                unravel_fn=unravel_fn,
+                batching=False,
+                lambda_reg=lambda_reg,
+            )
+        else:
+            # here we have the usual manifold
+            manifold = CrossEntropyManifold(
+                state_model_2,
+                x_train,
+                y_train,
+                unravel_fn=unravel_fn,
+                batching=False,
+                lambda_reg=lambda_reg,
+            )
 
     # now i have my manifold and so I can solve the expmap
     weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))
@@ -313,15 +339,27 @@ def main(args):
         linearized_grid_posterior_probabilities /= n_posterior_samples
         grid_posterior_confidence = linearized_grid_posterior_probabilities.max(1)
 
-        plot_ours_confidence(
-            x_train,
-            y_train,
-            grid_mesh_x,
-            grid_mesh_y,
-            grid_posterior_confidence,
-            linearized_grid_posterior_probabilities[:, 0],
-            title="Confidence RIEM LA linearized",
-        )
+        if args.savefig:
+            plot_confidence(
+                x_train,
+                y_train,
+                grid_mesh_x,
+                grid_mesh_y,
+                grid_posterior_confidence,
+                linearized_grid_posterior_probabilities[:, 0],
+                title="Confidence RIEM LA linearized",
+                save_path=f"{savepath}/RIEM_LA.pdf",
+            )
+        else:
+            plot_confidence(
+                x_train,
+                y_train,
+                grid_mesh_x,
+                grid_mesh_y,
+                grid_posterior_confidence,
+                linearized_grid_posterior_probabilities[:, 0],
+                title="Confidence RIEM LA linearized",
+            )
 
         P_grid_laplace_lin = 0
         P_test_laplace = 0
@@ -342,15 +380,26 @@ def main(args):
         P_grid_laplace_lin /= n_posterior_samples
         P_grid_laplace_conf = P_grid_laplace_lin.max(1)
 
-        plot_ours_confidence(
-            x_train,
-            y_train,
-            grid_mesh_x,
-            grid_mesh_y,
-            P_grid_laplace_conf,
-            P_grid_laplace_lin[:, 0],
-            title="Confidence LAPLACE linearized",
-        )
+        if args.savefig:
+            plot_confidence(
+                x_train,
+                y_train,
+                grid_mesh_x,
+                grid_mesh_y,
+                P_grid_laplace_conf,
+                P_grid_laplace_lin[:, 0],
+                title="Confidence LAPLACE linearized",
+                save_path=f"{savepath}/LA.pdf"
+            )
+        else:
+            plot_confidence(
+                x_train,
+                y_train,
+                grid_mesh_x,
+                grid_mesh_y,
+                P_grid_laplace_conf,
+                P_grid_laplace_lin[:, 0],
+                title="Confidence LAPLACE linearized")
 
         ## Now consider the test set:
         for n in range(n_posterior_samples):
@@ -393,15 +442,27 @@ def main(args):
         grid_posterior_probabilities /= n_posterior_samples
         grid_posterior_confidence = grid_posterior_probabilities.max(1)
 
-        plot_ours_confidence(
-            x_train,
-            y_train,
-            grid_mesh_x,
-            grid_mesh_y,
-            grid_posterior_confidence,
-            grid_posterior_probabilities[:, 0],
-            title="Confidence RIEM LA",
-        )
+        if args.savefig:
+            plot_confidence(
+                x_train,
+                y_train,
+                grid_mesh_x,
+                grid_mesh_y,
+                grid_posterior_confidence,
+                grid_posterior_probabilities[:, 0],
+                title="Confidence RIEM LA",
+                save_path=f"{savepath}/RIEM LA.pdf"
+            )
+        else: 
+            plot_confidence(
+                x_train,
+                y_train,
+                grid_mesh_x,
+                grid_mesh_y,
+                grid_posterior_confidence,
+                grid_posterior_probabilities[:, 0],
+                title="Confidence RIEM LA"
+            )
 
         test_posterior_probabilities = 0
         for n in range(n_posterior_samples):
@@ -422,16 +483,26 @@ def main(args):
 
         grid_posterior_probabilities_la /= n_posterior_samples
         grid_posterior_confidence_la = grid_posterior_probabilities_la.max(1)
-
-        plot_ours_confidence(
-            x_train,
-            y_train,
-            grid_mesh_x,
-            grid_mesh_y,
-            grid_posterior_confidence_la,
-            grid_posterior_probabilities_la[:, 0],
-            title="Confidence LAPLACE",
-        )
+        if args.savefig:
+            plot_confidence(
+                x_train,
+                y_train,
+                grid_mesh_x,
+                grid_mesh_y,
+                grid_posterior_confidence_la,
+                grid_posterior_probabilities_la[:, 0],
+                title="Confidence LAPLACE",
+                save_path=f"{savepath}/LA.pdf"
+            )
+        else:
+            plot_confidence(
+                x_train,
+                y_train,
+                grid_mesh_x,
+                grid_mesh_y,
+                grid_posterior_confidence_la,
+                grid_posterior_probabilities_la[:, 0],
+                title="Confidence LAPLACE")
 
         P_test_laplace = 0
         for n in range(n_posterior_samples):
@@ -550,7 +621,9 @@ if __name__ == "__main__":
         default=False,
         help="Linearization for prediction",
     )
+    parser.add_argument("--kfac", "-kfac", type=bool, default=False, help="Use the KFAC approximation")
     parser.add_argument("--diffrax", "-diffrax", type=bool, default=False, help="Solve with diffrax instead of scipy")
+    parser.add_argument("--savefig", "-savefig", type= bool, default=False, help="Whether figures should be saved")
 
     args = parser.parse_args()
     main(args)

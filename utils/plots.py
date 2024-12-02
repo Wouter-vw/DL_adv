@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def plot_map_confidence(x_train, y_train, XX1, XX2, conf, title="Confidence MAP"):
+def plot_map_confidence(x_train, y_train, XX1, XX2, conf, title="Confidence MAP", save_path=None):
     """Plots MAP confidence with training data."""
     plt.contourf(
         XX1,
@@ -34,11 +34,14 @@ def plot_map_confidence(x_train, y_train, XX1, XX2, conf, title="Confidence MAP"
     plt.title(title)
     plt.xticks([], [])
     plt.yticks([], [])
-    plt.show()
+    if save_path:
+        plt.savefig(save_path)
+    else:
+        plt.show()
 
 
-def plot_ours_confidence(x_train, y_train, XX1, XX2, conf, contours, title="Confidence OURS"):
-    """Plots OUR method's confidence with training data."""
+def plot_confidence(x_train, y_train, XX1, XX2, conf, contours, title="Confidence", save_path=None):
+    """Plots confidence with training data."""
     plt.contourf(
         XX1,
         XX2,
@@ -73,4 +76,7 @@ def plot_ours_confidence(x_train, y_train, XX1, XX2, conf, contours, title="Conf
     plt.xticks([], [])
     plt.yticks([], [])
     plt.title(title)
-    plt.show()
+    if save_path:
+        plt.savefig(save_path)
+    else:
+        plt.show()
