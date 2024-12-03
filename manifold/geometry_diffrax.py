@@ -27,8 +27,8 @@ def expmap(manifold, x, v):
 
     # ODE functions
     @jax.jit
-    def function_ode(t, c_dc, args):       
-        return first_order_odes(manifold, c_dc).flatten()
+    def function_ode(t, curve_velocity, args):       
+        return first_order_odes(manifold, curve_velocity).flatten()
     
     # Initial conditions
     init = jnp.concatenate((x, v), axis=0).flatten()
