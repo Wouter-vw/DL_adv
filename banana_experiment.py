@@ -137,6 +137,7 @@ def main(args):
 
     def get_map_solution(state):
         map_solution, unravel_fn = jax.flatten_util.ravel_pytree(state.params)
+        map_solution = jnp.array(map_solution, dtype=jnp.float64)
         return map_solution, unravel_fn
 
     map_solution, unravel_fn = get_map_solution(state)
@@ -173,7 +174,7 @@ def main(args):
         nn_torch.Linear(H, H),
         torch.nn.Tanh(),
         nn_torch.Linear(H, num_output),
-    )
+    ).to(dtype=torch.float64)
 
     layer_mapping = {
         "Dense_0": model_torch[0],  # First Linear layer
@@ -184,20 +185,21 @@ def main(args):
     # Transfer weights and biases
     for flax_layer, torch_layer in layer_mapping.items():
         # Convert and load Flax weights (transpose to match PyTorch)
-        weight = torch.tensor(np.array(state.params["params"][flax_layer]["kernel"])).T
+        weight = torch.tensor(np.array(state.params["params"][flax_layer]["kernel"]), dtype=torch.float64).T
         # Ensure the weight tensor is contiguous
         torch_layer.weight.data = weight.contiguous()
 
         # Convert and load Flax bias (no transpose needed)
-        bias = torch.tensor(np.array(state.params["params"][flax_layer]["bias"]))
+        bias = torch.tensor(np.array(state.params["params"][flax_layer]["bias"]), dtype=torch.float64)
         # Ensure the bias tensor is contiguous
         torch_layer.bias.data = bias.contiguous()
 
     # We need to define a torch dataloader quickly
-    x_torch_train = torch.from_numpy(np.array(x_train))
+    x_torch_train = torch.from_numpy(np.array(x_train)).to(dtype=torch.float64)
     y_torch_train = torch.from_numpy(np.array(y_train)).long()
     train_torch_dataset = torch.utils.data.TensorDataset(x_torch_train, y_torch_train)
     train_torch_loader = torch.utils.data.DataLoader(train_torch_dataset, batch_size=265, shuffle=True)
+
 
     print("Fitting Laplace")
     la = Laplace(
@@ -215,7 +217,7 @@ def main(args):
     print("Prior precision we are using")
     print(la.prior_precision)
 
-    scale_tril = jnp.array(la.posterior_scale)
+    scale_tril = jnp.array(la.posterior_scale, dtype=jnp.float64)
     velocity_samples_laplace = jax.random.multivariate_normal(
         rng,
         mean=jnp.zeros_like(map_solution),
@@ -321,7 +323,7 @@ def main(args):
             w_OUR = weights_ours[n, :]
             params = unravel_fn(map_solution)
 
-            diff_weights = (w_OUR - map_solution).astype(jnp.float32)
+            diff_weights = (w_OUR - map_solution).astype(jnp.float64)
 
             diff_as_params = unravel_fn(diff_weights)
 
@@ -407,7 +409,7 @@ def main(args):
             w_OUR = weights_ours[n, :]
             params = unravel_fn(map_solution)
 
-            diff_weights = (w_OUR - map_solution).astype(jnp.float32)
+            diff_weights = (w_OUR - map_solution).astype(jnp.float64)
 
             diff_as_params = unravel_fn(diff_weights)
 

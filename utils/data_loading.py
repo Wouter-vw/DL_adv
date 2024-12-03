@@ -27,13 +27,13 @@ def load_banana_data(shuffle=True):
     y_train = y_train[:265]
 
     # define train , valid, test, create data loader for training
-    x_train = x_train.astype(jnp.float32)
-    x_valid = x_valid.astype(jnp.float32)
-    x_test = x_test.astype(jnp.float32)
+    x_train = x_train.astype(jnp.float64)
+    x_valid = x_valid.astype(jnp.float64)
+    x_test = x_test.astype(jnp.float64)
     # labels are integers
-    y_train = y_train.astype(jnp.int32)
-    y_valid = y_valid.astype(jnp.int32)
-    y_test = y_test.astype(jnp.int32)
+    y_train = y_train.astype(jnp.int64)
+    y_valid = y_valid.astype(jnp.int64)
+    y_test = y_test.astype(jnp.int64)
 
     return x_train, x_valid, x_test, y_train, y_valid, y_test
 
