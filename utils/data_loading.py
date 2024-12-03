@@ -5,7 +5,7 @@ import numpy as np
 import sklearn.model_selection
 
 def load_banana_data(shuffle=True):
-    # now I have to laod the banana dataset
+    # We have to load the banana dataset
     filen = os.path.join("data", "banana", "banana.csv")
     Xy = np.loadtxt(filen, delimiter=",")
     Xy = jnp.asarray(Xy)
@@ -15,7 +15,8 @@ def load_banana_data(shuffle=True):
 
     split_train_size = 0.7
     strat = None
-    x_full, y_full = jnp.concatenate((x_train, x_test)), jnp.concatenate((y_train, y_test))
+    x_full, y_full = jnp.concatenate((x_train, x_test)), jnp.concatenate((y_train, y_test)) # full dataset
+    # Split the data into train, valid, test
     x_train, x_test, y_train, y_test = sklearn.model_selection.train_test_split(
         x_full, y_full, train_size=split_train_size, random_state=230, shuffle=shuffle, stratify=strat
     )

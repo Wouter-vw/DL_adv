@@ -51,7 +51,7 @@ def return_sol(sol):
     velocity = curve_velocity[D:].reshape(D, 1)
     return curve, velocity
 
-# Solving the exponential map, Change solver when fail, if fail again return init
+# Solving the exponential map. Change solver when fail, if fail again return init
 def expmap(manifold, x, v):
     try:
         sol = solve_with_solver(manifold, diffrax.Tsit5(), x, v)
