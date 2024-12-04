@@ -2,13 +2,12 @@
 File containing the banana experiments
 """
 
-
 import torch
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import sys
-import sklearn.model_selection
+import time
 
 from laplace import Laplace
 import matplotlib.colors as colors
@@ -29,7 +28,58 @@ from functorch_utils import get_params_structure, stack_gradient, custum_hvp, st
 import os
 
 
+def write_results_to_csv(flags, metrics, time_dict, output_file="banana_results_original.csv"):
+    column_names = [
+        "seed",
+        "optimize_prior",
+        "samples",
+        "linearized_pred",
+        "kfac",
+        "diffrax",
+        "savefig",
+        "accuracy_MAP",
+        "nll_MAP",
+        "brier_MAP",
+        "ece_map",
+        "mce_map",
+        "accuracy_posterior",
+        "nll_posterior",
+        "brier_posterior",
+        "ece_posterior",
+        "mce_posterior",
+        "accuracy_laplace",
+        "nll_laplace",
+        "brier_laplace",
+        "ece_laplace",
+        "mce_laplace",
+        "Total_time",
+        "Exmap_time",
+        "Laplace_time",
+        "NetworkTraining_time",
+    ]
+
+    # Check if file exists, if not create it with headers
+    file_exists = os.path.isfile(output_file)
+    with open(output_file, mode="a", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=column_names)
+        if not file_exists:
+            writer.writeheader()  # Write the header row
+
+        # Combine flags, metrics, and time_dict into one dictionary
+        row = {
+            **flags,
+            **metrics,
+            "Total_time": time_dict.get("Total", None),
+            "Exmap_time": time_dict.get("Exmap", None),
+            "Laplace_time": time_dict.get("Laplace", None),
+            "NetworkTraining_time": time_dict.get("NetworkTraining", None),
+        }
+        writer.writerow(row)  # Append the row to the file
+
+
 def main(args):
+    total_start = time.time()
+    time_dict = {}
     # sns.set_style('darkgrid')
     palette = sns.color_palette("colorblind")
     print("Linearizatin?")
@@ -61,23 +111,15 @@ def main(args):
     split_train_size = 0.7
     strat = None
     x_full, y_full = np.concatenate((x_train, x_test)), np.concatenate((y_train, y_test))
-    x_train, x_test, y_train, y_test = sklearn.model_selection.train_test_split(
-        x_full, y_full, train_size=split_train_size, random_state=230, shuffle=shuffle, stratify=strat
-    )
-    x_test, x_valid, y_test, y_valid = sklearn.model_selection.train_test_split(
-        x_test, y_test, train_size=0.5, random_state=230, shuffle=shuffle, stratify=strat
-    )
+    x_train, x_test, y_train, y_test = sklearn.model_selection.train_test_split(x_full, y_full, train_size=split_train_size, random_state=230, shuffle=shuffle, stratify=strat)
+    x_test, x_valid, y_test, y_valid = sklearn.model_selection.train_test_split(x_test, y_test, train_size=0.5, random_state=230, shuffle=shuffle, stratify=strat)
 
     x_train = x_train[:265, :]
     y_train = y_train[:265]
 
     print(matplotlib.rcParams["lines.markersize"] ** 2)
-    plt.scatter(
-        x_train[:, 0][y_train == 0], x_train[:, 1][y_train == 0], c="orange", edgecolors="black", s=45, alpha=1
-    )
-    plt.scatter(
-        x_train[:, 0][y_train == 1], x_train[:, 1][y_train == 1], c="violet", edgecolors="black", s=45, alpha=1
-    )
+    plt.scatter(x_train[:, 0][y_train == 0], x_train[:, 1][y_train == 0], c="orange", edgecolors="black", s=45, alpha=1)
+    plt.scatter(x_train[:, 0][y_train == 1], x_train[:, 1][y_train == 1], c="violet", edgecolors="black", s=45, alpha=1)
     plt.xticks([], [])
     plt.yticks([], [])
     plt.title("Train")
@@ -106,13 +148,13 @@ def main(args):
     valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=50, shuffle=False)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=50, shuffle=False)
 
+    ####### Neural Network #####################################################################################################
+    start = time.time()
     num_features = x_train.shape[-1]
     num_output = 2
     H = 16
 
-    model = nn.Sequential(
-        nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output)
-    )
+    model = nn.Sequential(nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output))
 
     if args.optimizer == "sgd":
         weight_decay = 1e-2
@@ -155,6 +197,8 @@ def main(args):
         if (epoch + 1) % 100 == 0:
             print("Epoch: {}, Train loss: {}, Valid acc: {}".format(epoch + 1, train_loss, valid_accuracy))
 
+    time_dict["NetworkTraining"] = time.time() - start
+
     # at the end of the training I can get the map solution
     map_solution = torch.nn.utils.parameters_to_vector(model.parameters()).detach().clone()
 
@@ -188,17 +232,16 @@ def main(args):
         levels=np.arange(0.0, 1.01, 0.1),
     )
     plt.colorbar()
-    plt.scatter(
-        x_train[:, 0][y_train == 0], x_train[:, 1][y_train == 0], c="orange", edgecolors="black", s=45, alpha=1
-    )
-    plt.scatter(
-        x_train[:, 0][y_train == 1], x_train[:, 1][y_train == 1], c="violet", edgecolors="black", s=45, alpha=1
-    )
+    plt.scatter(x_train[:, 0][y_train == 0], x_train[:, 1][y_train == 0], c="orange", edgecolors="black", s=45, alpha=1)
+    plt.scatter(x_train[:, 0][y_train == 1], x_train[:, 1][y_train == 1], c="violet", edgecolors="black", s=45, alpha=1)
     plt.title("Confidence MAP")
     plt.xticks([], [])
     plt.yticks([], [])
     # plt.savefig('banana_plots_classic/MAP.pdf')
     plt.show()
+
+    ####### Laplace approximation #####################################################################################################
+    start = time.time()
 
     print("Fitting Laplace")
     la = Laplace(
@@ -209,6 +252,8 @@ def main(args):
         prior_precision=2 * weight_decay,
     )
     la.fit(train_loader)
+
+    time_dict["Laplace"] = time.time() - start
 
     if optimize_prior:
         la.optimize_prior_precision(method="marglik")
@@ -243,6 +288,9 @@ def main(args):
             V_LA = V_LA.detach().numpy()
             print(V_LA.shape)
 
+    ####### Exmap #####################################################################################################
+    start = time.time()
+
     # ok now I have the initial velocities. I can therefore consider my manifold
     if args.linearized_pred:
         # here I have to first compute the f_MAP in both cases
@@ -261,9 +309,7 @@ def main(args):
             print(ll_map.shape)
 
             # and now I have to define again the model
-            feature_extractor_model = torch.nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh()
-            )
+            feature_extractor_model = torch.nn.Sequential(nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh())
             ll = nn.Linear(H, num_output)
 
             # and use the correct weights
@@ -288,14 +334,10 @@ def main(args):
                 )
 
             else:
-                manifold = linearized_cross_entropy_manifold(
-                    ll, R, y_train, f_MAP=f_MAP, theta_MAP=ll_map, batching=False, lambda_reg=weight_decay
-                )
+                manifold = linearized_cross_entropy_manifold(ll, R, y_train, f_MAP=f_MAP, theta_MAP=ll_map, batching=False, lambda_reg=weight_decay)
 
         else:
-            model2 = nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output)
-            )
+            model2 = nn.Sequential(nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output))
             # here depending if I am using a diagonal approx, I have to redefine the model
             if batch_data:
                 # i have to create the new train loader in this case
@@ -360,9 +402,7 @@ def main(args):
             print(ll_map.shape)
 
             # and now I have to define again the model
-            feature_extractor_model = torch.nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh()
-            )
+            feature_extractor_model = torch.nn.Sequential(nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh())
             ll = nn.Linear(H, num_output)
 
             # and use the correct weights
@@ -376,38 +416,26 @@ def main(args):
                 R = feature_extractor_model(x_train)
 
             if optimize_prior:
-                manifold = cross_entropy_manifold(
-                    ll, R, y_train, batching=False, lambda_reg=la.prior_precision.item() / 2
-                )
+                manifold = cross_entropy_manifold(ll, R, y_train, batching=False, lambda_reg=la.prior_precision.item() / 2)
 
             else:
                 manifold = cross_entropy_manifold(ll, R, y_train, batching=False, lambda_reg=weight_decay)
 
         else:
-            model2 = nn.Sequential(
-                nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output)
-            )
+            model2 = nn.Sequential(nn.Linear(num_features, H), torch.nn.Tanh(), nn.Linear(H, H), torch.nn.Tanh(), nn.Linear(H, num_output))
             # here depending if I am using a diagonal approx, I have to redefine the model
             if optimize_prior:
                 if batch_data:
-                    manifold = cross_entropy_manifold(
-                        model2, train_loader, y=None, batching=True, lambda_reg=la.prior_precision.item() / 2
-                    )
+                    manifold = cross_entropy_manifold(model2, train_loader, y=None, batching=True, lambda_reg=la.prior_precision.item() / 2)
 
                 else:
-                    manifold = cross_entropy_manifold(
-                        model2, x_train, y_train, batching=False, lambda_reg=la.prior_precision.item() / 2
-                    )
+                    manifold = cross_entropy_manifold(model2, x_train, y_train, batching=False, lambda_reg=la.prior_precision.item() / 2)
             else:
                 if batch_data:
-                    manifold = cross_entropy_manifold(
-                        model2, train_loader, y=None, batching=True, lambda_reg=weight_decay
-                    )
+                    manifold = cross_entropy_manifold(model2, train_loader, y=None, batching=True, lambda_reg=weight_decay)
 
                 else:
-                    manifold = cross_entropy_manifold(
-                        model2, x_train, y_train, batching=False, lambda_reg=weight_decay
-                    )
+                    manifold = cross_entropy_manifold(model2, x_train, y_train, batching=False, lambda_reg=weight_decay)
 
     # now i have my manifold and so I can solve the expmap
     weights_ours = torch.zeros(n_posterior_samples, len(map_solution))
@@ -417,9 +445,7 @@ def main(args):
         if subset_of_weights == "last_layer":
             curve, failed = geometry.expmap(manifold, ll_map.clone(), v)
             _new_ll_weights = curve(1)[0]
-            _new_weights = torch.cat(
-                (feature_extractor_map.view(-1), torch.from_numpy(_new_ll_weights).float().view(-1)), dim=0
-            )
+            _new_weights = torch.cat((feature_extractor_map.view(-1), torch.from_numpy(_new_ll_weights).float().view(-1)), dim=0)
             weights_ours[n, :] = _new_weights.view(-1)
             torch.nn.utils.vector_to_parameters(_new_weights, model.parameters())
 
@@ -474,6 +500,8 @@ def main(args):
             # laplace_weigths = torch.cat((feature_extractor_MAP.clone().view(-1), laplace_weigths.view(-1)), dim=0)
             weights_LA[n, :] = laplace_weigths.cpu()
 
+    time_dict["Expmap"] = time.time() - start
+
     # now I can use my weights for prediction. Deoending if I am using linearization or not the prediction looks differently
     if args.linearized_pred:
         if subset_of_weights == "last_layer":
@@ -507,9 +535,7 @@ def main(args):
                 w_LA = weights_LA[n, :]
                 w_ll_LA = w_LA[-n_last_layer_weights:]
 
-                assert len(w_ll_LA) == len(
-                    ll_map
-                ), "We have a problem in the length of the last layer weights we are considering"
+                assert len(w_ll_LA) == len(ll_map), "We have a problem in the length of the last layer weights we are considering"
                 # put the weights into the model
                 torch.nn.utils.vector_to_parameters(ll_map, ll.parameters())
                 ll.zero_grad()
@@ -521,9 +547,7 @@ def main(args):
                 diff_as_params = get_params_structure(diff_weights, params)
 
                 # here I have to use the new dataset to predict
-                _, jvp_value_grid = jvp(
-                    predict, (params, R_MAP_grid), (diff_as_params, torch.zeros_like(R_MAP_grid)), strict=False
-                )
+                _, jvp_value_grid = jvp(predict, (params, R_MAP_grid), (diff_as_params, torch.zeros_like(R_MAP_grid)), strict=False)
 
                 f_LA_grid = f_MAP_grid + jvp_value_grid
 
@@ -535,9 +559,7 @@ def main(args):
             for n in range(n_posterior_samples):
                 w_OUR = weights_ours[n, :]
                 w_ll_OUR = w_OUR[-n_last_layer_weights:]
-                assert len(w_ll_OUR) == len(
-                    ll_map
-                ), "We have a problem in the length of the last layer weights we are considering"
+                assert len(w_ll_OUR) == len(ll_map), "We have a problem in the length of the last layer weights we are considering"
                 # put the weights into the model
                 torch.nn.utils.vector_to_parameters(ll_map, ll.parameters())
                 ll.zero_grad()
@@ -549,9 +571,7 @@ def main(args):
                 diff_as_params = get_params_structure(diff_weights, params)
 
                 # here I have to use the new dataset to predict
-                _, jvp_value_grid = jvp(
-                    predict, (params, R_MAP_grid), (diff_as_params, torch.zeros_like(R_MAP_grid)), strict=False
-                )
+                _, jvp_value_grid = jvp(predict, (params, R_MAP_grid), (diff_as_params, torch.zeros_like(R_MAP_grid)), strict=False)
 
                 f_OUR_grid = f_MAP_grid + jvp_value_grid
 
@@ -657,9 +677,7 @@ def main(args):
             alpha=1.0,
             zorder=10,
         )
-        plt.contour(
-            XX1, XX2, P_grid_LAPLACE_lin[:, 0].reshape(N_grid, N_grid), levels=[0.5], colors="k", alpha=0.5, zorder=0
-        )
+        plt.contour(XX1, XX2, P_grid_LAPLACE_lin[:, 0].reshape(N_grid, N_grid), levels=[0.5], colors="k", alpha=0.5, zorder=0)
         plt.xticks([], [])
         plt.yticks([], [])
         plt.title("All weights, full Hessian approx - Confidence LA linearized")
@@ -698,9 +716,7 @@ def main(args):
             alpha=1,
             zorder=10,
         )
-        plt.contour(
-            XX1, XX2, P_grid_OURS_lin[:, 0].reshape(N_grid, N_grid), levels=[0.5], colors="k", alpha=0.5, zorder=0
-        )
+        plt.contour(XX1, XX2, P_grid_OURS_lin[:, 0].reshape(N_grid, N_grid), levels=[0.5], colors="k", alpha=0.5, zorder=0)
         # plt.title('All weights, full Hessian approx - Confidence OURS linearized')
         plt.xticks([], [])
         plt.yticks([], [])
@@ -734,9 +750,7 @@ def main(args):
 
             diff_as_params = get_params_structure(diff_weights, params)
 
-            _, jvp_value_test = jvp(
-                predict, (params, x_test), (diff_as_params, torch.zeros_like(x_test)), strict=False
-            )
+            _, jvp_value_test = jvp(predict, (params, x_test), (diff_as_params, torch.zeros_like(x_test)), strict=False)
 
             f_LA_test = f_MAP_test + jvp_value_test
 
@@ -757,9 +771,7 @@ def main(args):
             # I have to make the diff_weights with the same tree shape as the params
             diff_as_params = get_params_structure(diff_weights, params)
 
-            _, jvp_value_grid = jvp(
-                predict, (params, x_test), (diff_as_params, torch.zeros_like(x_test)), strict=False
-            )
+            _, jvp_value_grid = jvp(predict, (params, x_test), (diff_as_params, torch.zeros_like(x_test)), strict=False)
 
             f_OUR_test = f_MAP_test + jvp_value_grid
 
@@ -809,9 +821,7 @@ def main(args):
             alpha=1.0,
             zorder=10,
         )
-        plt.contour(
-            XX1, XX2, P_grid_LAPLACE[:, 0].reshape(N_grid, N_grid), levels=[0.5], colors="k", alpha=0.5, zorder=0
-        )
+        plt.contour(XX1, XX2, P_grid_LAPLACE[:, 0].reshape(N_grid, N_grid), levels=[0.5], colors="k", alpha=0.5, zorder=0)
         plt.title("All weights, full Hessian approx - Confidence LA")
         plt.xticks([], [])
         plt.yticks([], [])
@@ -945,6 +955,41 @@ def main(args):
     dict_OUR = {"Accuracy": accuracy_OURS, "NLL": nll_OUR, "Brier": brier_OURS, "ECE": ece_our, "MCE": mce_our}
 
     final_dict = {"results_MAP": dict_MAP, "results_LA": dict_LA, "results_OUR": dict_OUR}
+
+    time_dict["Total"] = time.time() - total_start
+
+    flags = {
+        "seed": seed,
+        "optimizer": optimizer,
+        "optimize_prior": optimize_prior,
+        "batch_data": batch_data,
+        "structure": hessian_structure,
+        "subset": subset_of_weights,
+        "samples": n_posterior_samples,
+        "linearized_pred": args.linearized_pred,
+        "expmap_different_batches": args.expmap_different_batches,
+        "test_all": args.test_all,
+    }
+
+    metrics = {
+        "accuracy_MAP": accuracy_MAP,
+        "nll_MAP": nll_MAP,
+        "brier_MAP": brier_MAP,
+        "ece_MAP": ece_map,
+        "mce_MAP": mce_map,
+        "accuracy_LA": accuracy_LA,
+        "nll_LA": nll_LA,
+        "brier_LA": brier_LA,
+        "ece_LA": ece_la,
+        "mce_LA": mce_la,
+        "accuracy_OURS": accuracy_OURS,
+        "nll_OURS": nll_OUR,
+        "brier_OURS": brier_OURS,
+        "ece_OURS": ece_our,
+        "mce_OURS": mce_our,
+    }
+
+    write_results_to_csv(flags, metrics, time_dict)
 
 
 if __name__ == "__main__":
