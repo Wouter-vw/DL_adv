@@ -41,7 +41,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module=r".*laplace\.base
 def write_results_to_csv(flags, metrics, time_dict, output_file="banana_results.csv"):
     column_names = [
         "seed",
-        "optimizer",
         "optimize_prior",
         "samples",
         "linearized_pred",
@@ -129,7 +128,7 @@ def main(args):
     total_start = time.time()
     # Print the input flags
     print(
-        f"Input Flags: Seed: {args.seed}, Linearization? {args.linearized_pred}, # Posterior Samples: {args.samples}, Prior Optimization? {args.optimize_prior}, Optimizer: {args.optimizer}, KFAC? {args.kfac}, Diffrax? {args.diffrax}, Epochs: {args.epochs}"
+        f"Input Flags: Seed: {args.seed}, Linearization? {args.linearized_pred}, # Posterior Samples: {args.samples}, Prior Optimization? {args.optimize_prior}, KFAC? {args.kfac}, Diffrax? {args.diffrax}, Epochs: {args.epochs}"
     )
     n_posterior_samples = args.samples
     optimize_prior = args.optimize_prior
@@ -145,7 +144,7 @@ def main(args):
 
     # Save the plots if the flag is set
     if args.savefig:
-        savepath = f"plots_seed_{args.seed}_linearized_{args.linearized_pred}_samples_{args.samples}_optimize_prior_{args.optimize_prior}_optimizer_{args.optimizer}_diffrax_{args.diffrax}"
+        savepath = f"plots_seed_{args.seed}_linearized_{args.linearized_pred}_samples_{args.samples}_optimize_prior_{args.optimize_prior}_diffrax_{args.diffrax}"
         ## Create a folder to save the plots
         if not os.path.exists("plots"):
             os.makedirs(savepath)
@@ -161,19 +160,14 @@ def main(args):
     max_epoch = args.epochs
 
     # Define the optimizer
-    if args.optimizer == "sgd":  # SGD optimizer
-        learning_rate = 1e-3
-        weight_decay = 1e-2
+    learning_rate = 1e-3
+    weight_decay = 1e-2
 
-        # Define the optimizer with weight decay
-        optimizer = optax.chain(
-            optax.add_decayed_weights(weight_decay),  # Apply weight decay
-            optax.sgd(learning_rate),  # SGD optimizer
-        )
-    else:  # AdamW optimizer
-        learning_rate = 1e-3
-        weight_decay = 1e-3
-        optimizer = optax.adamw(learning_rate, weight_decay=weight_decay)
+    # Define the optimizer with weight decay
+    optimizer = optax.chain(
+        optax.add_decayed_weights(weight_decay),  # Apply weight decay
+        optax.sgd(learning_rate),  # SGD optimizer
+    )
 
     ####### Neural Network #####################################################################################################
     start = time.time()
@@ -643,7 +637,6 @@ def main(args):
 
     flags = {
         "seed": args.seed,
-        "optimizer": args.optimizer,
         "optimize_prior": args.optimize_prior,
         "samples": args.samples,
         "linearized_pred": args.linearized_pred,
@@ -677,7 +670,6 @@ if __name__ == "__main__":
     # Parse the input arguments in the different flags
     parser = argparse.ArgumentParser(description="Geomeatric Approximate Inference (GEOMAI)")
     parser.add_argument("--seed", "-s", type=int, default=230, help="seed")
-    parser.add_argument("--optimizer", "-optim", type=str, default="sgd", help="optimizer used to train the model")
     parser.add_argument("--optimize_prior", "-opt_prior", type=bool, default=False, help="optimize prior")
     parser.add_argument("--samples", "-samp", type=int, default=100, help="number of posterior samples")
     parser.add_argument("--linearized_pred", "-lin", type=bool, default=False, help="Linearization")
