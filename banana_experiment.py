@@ -256,15 +256,12 @@ def main(args):
     for flax_layer, torch_layer in layer_mapping.items():
         # Convert and load Flax weights (transpose to match PyTorch)
         weight = torch.tensor(np.array(state.params["params"][flax_layer]["kernel"]), dtype=torch.float64).T
-        # Ensure the weight tensor is contiguous
         torch_layer.weight.data = weight.contiguous()
 
         # Convert and load Flax bias (no transpose needed)
         bias = torch.tensor(np.array(state.params["params"][flax_layer]["bias"]), dtype=torch.float64)
-        # Ensure the bias tensor is contiguous
         torch_layer.bias.data = bias.contiguous()
 
-    # We need to define a torch dataloader quickly
     x_torch_train = torch.from_numpy(np.array(x_train)).to(dtype=torch.float64)
     y_torch_train = torch.from_numpy(np.array(y_train)).long()
     train_torch_dataset = torch.utils.data.TensorDataset(x_torch_train, y_torch_train)  # Create a dataset
@@ -302,11 +299,9 @@ def main(args):
     for n in range(n_posterior_samples):
         velocity_samples_laplace = velocity_samples_laplace.at[n, :].set(rearrange_velocity_samples_laplace(velocity_samples_laplace[n, :]))
 
-    #  Now we have the initial velocities  and, therefore, we can consider the manifold
     if optimize_prior:
-        lambda_reg = la.prior_precision.item() / 2  # Regularization parameter
-    else:
-        lambda_reg = weight_decay  # Regularization parameter
+        lambda_reg = la.prior_precision.item() / 2
+        lambda_reg = weight_decay
 
     ####### Exmap #####################################################################################################
     start = time.time()
@@ -314,11 +309,9 @@ def main(args):
 
     if args.kfac:  # KFAC approximation
         if args.linearized_pred:
-            # We have to first compute the f_MAP in both cases
             state = state.replace(params=unravel_fn(map_solution))
             f_MAP = state.apply_fn(state.params, x_train)
 
-            # Linearized manifold
             manifold = LinearizedCrossEntropyManifold_kfac(
                 model,
                 state_model_2,
@@ -331,7 +324,6 @@ def main(args):
                 lambda_reg=lambda_reg,
             )
         else:
-            # Usual manifold (Non-linearized)
             manifold = CrossEntropyManifold_kfac(
                 model,
                 state_model_2,
@@ -343,11 +335,9 @@ def main(args):
             )
     else:
         if args.linearized_pred:
-            # We have to first compute the f_MAP in both cases
             state = state.replace(params=unravel_fn(map_solution))
             f_MAP = state.apply_fn(state.params, x_train)
 
-            # Linearized manifold
             manifold = LinearizedCrossEntropyManifold(
                 state_model_2,
                 x_train,
@@ -359,7 +349,6 @@ def main(args):
                 lambda_reg=lambda_reg,
             )
         else:
-            # Usual manifold (Non-linearized)
             manifold = CrossEntropyManifold(
                 state_model_2,
                 x_train,
@@ -369,7 +358,6 @@ def main(args):
                 lambda_reg=lambda_reg,
             )
 
-    # Now we have the manifold and we can solve the exponential map
     weights_ours = jnp.zeros((n_posterior_samples, len(map_solution)))  # Initialize the weights
     for n in tqdm(range(n_posterior_samples), desc="Solving expmap"):
         v = velocity_samples_laplace[n, :].reshape(-1, 1)  # Reshape the velocity samples
@@ -384,8 +372,6 @@ def main(args):
 
     time_dict["Exmap"] = time.time() - start
 
-    #######
-    # We can use the weights for prediction. Depending if I am using linearization or not the prediction looks differently
     if args.linearized_pred:
         state_model_2 = state_model_2.replace(params=unravel_fn(map_solution))
         f_MAP_grid = state_model_2.apply_fn(state_model_2.params, grid_points)
@@ -398,9 +384,7 @@ def main(args):
         linearized_grid_posterior_probabilities = 0
         test_posterior_probabilities = 0
 
-        # Now we can do the same for our method
         for n in range(n_posterior_samples):
-            # Get the theta weights we are interested in #
             w_OUR = weights_ours[n, :]  # Weights
             params = unravel_fn(map_solution)
 
@@ -448,7 +432,7 @@ def main(args):
         P_grid_laplace_lin = 0
         P_test_laplace = 0
 
-        ## Now we seek to compute the baseline laplace
+        # Compute the baseline laplace
         for n in range(n_posterior_samples):
             weights_laplace = velocity_samples_laplace[n, :]
             state_model_2 = state_model_2.replace(params=unravel_fn(map_solution))
@@ -469,7 +453,7 @@ def main(args):
         else:  # Display the plots
             plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, P_grid_laplace_conf, P_grid_laplace_lin[:, 0], title="Confidence LAPLACE linearized")
 
-        ## Now consider the test set:
+        # Test set:
         for n in range(n_posterior_samples):
             # Get the theta weights we are interested in #
             w_OUR = weights_ours[n, :]
@@ -498,7 +482,6 @@ def main(args):
             P_test_laplace += probs_test_laplace
 
     else:  # Non-linearized prediction
-        # and then our stuff
         grid_posterior_probabilities = 0
         for n in range(n_posterior_samples):
             # Put the weights in the model
@@ -521,7 +504,6 @@ def main(args):
             # compute the predictions
             test_posterior_probabilities += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
 
-        # and then laplace stuff
         grid_posterior_probabilities_la = 0
         for n in range(n_posterior_samples):
             laplace_weights = velocity_samples_laplace[n, :] + map_solution
@@ -545,8 +527,6 @@ def main(args):
             # compute the predictions
             P_test_laplace += jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)
 
-    # We can compute and plot the results
-
     test_posterior_probabilities /= n_posterior_samples
     P_test_laplace /= n_posterior_samples
 
@@ -557,7 +537,6 @@ def main(args):
     test_posterior_probabilities_torch = torch.from_numpy(np.array(test_posterior_probabilities))
     y_test_torch = torch.from_numpy(np.array(y_test))
 
-    # Compute the Expected Calibration Error (ECE)
     ece = (
         calibration_error(
             test_posterior_probabilities_torch,
@@ -570,7 +549,6 @@ def main(args):
         * 100
     )
 
-    # Compute the Maximum Calibration Error (MCE)
     mce = (
         calibration_error(
             test_posterior_probabilities_torch,
@@ -588,7 +566,6 @@ def main(args):
     brier_score_laplace = brier(P_test_laplace, y_test)  # Compute Brier score for Laplace
 
     P_test_laplace_torch = torch.from_numpy(np.array(P_test_laplace))
-    # Compute the Expected Calibration Error (ECE) for Laplace
     ece_laplace = (
         calibration_error(
             P_test_laplace_torch,
@@ -600,7 +577,6 @@ def main(args):
         )
         * 100
     )
-    # Compute the Maximum Calibration Error (MCE) for Laplace
     mce_laplace = (
         calibration_error(
             P_test_laplace_torch,
@@ -616,21 +592,17 @@ def main(args):
     # ece = calibration_error(test_posterior_probabilities, y_test, norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
     # mce = calibration_error(test_posterior_probabilities, y_test, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
 
-    ## Lets compare to the MAP Estimates too!
     state = state.replace(params=unravel_fn(map_solution))  # Update the state with the MAP solution
     P_test_MAP = jax.nn.softmax(state.apply_fn(state.params, x_test), axis=1)  # Compute the MAP probabilities
     accuracy_MAP = accuracy(P_test_MAP, y_test)  # Compute accuracy for MAP
     nll_MAP = nll(P_test_MAP, y_test)  # Compute negative log likelihood for MAP
     brier_MAP = brier(P_test_MAP, y_test)  # Compute Brier score for MAP
     MAP_probs_torch = torch.from_numpy(np.array(P_test_MAP))
-    # Compute the Expected Calibration Error (ECE) for MAP
     ece_map = calibration_error(MAP_probs_torch, y_test_torch, norm="l1", task="multiclass", num_classes=2, n_bins=10) * 100
-    # Compute the Maximum Calibration Error (MCE) for MAP
     mce_map = calibration_error(MAP_probs_torch, y_test_torch, norm="max", task="multiclass", num_classes=2, n_bins=10) * 100
 
     time_dict["Total"] = time.time() - total_start
 
-    # Print the results
     print(f"Results MAP: accuracy {accuracy_MAP}, nll {nll_MAP}, brier {brier_MAP}, ECE {ece_map}, MCE {mce_map}")
     print(f"Results RIEM LA: accuracy {accuracy_posterior}, nll {negative_log_likelihood}, brier {brier_score}, ECE {ece}, MCE {mce}")
     print(f"Results LA: accuracy {accuracy_laplace}, nll {nll_laplace}, brier {brier_score_laplace}, ECE {ece_laplace}, MCE {mce_laplace}")
@@ -667,7 +639,6 @@ def main(args):
 
 
 if __name__ == "__main__":
-    # Parse the input arguments in the different flags
     parser = argparse.ArgumentParser(description="Geomeatric Approximate Inference (GEOMAI)")
     parser.add_argument("--seed", "-s", type=int, default=230, help="seed")
     parser.add_argument("--optimize_prior", "-opt_prior", type=bool, default=False, help="optimize prior")

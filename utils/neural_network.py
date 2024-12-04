@@ -6,19 +6,19 @@ import optax
 
 
 # Define your model using Flax
-class MLP(nn.Module):   # Define a simple MLP
+class MLP(nn.Module):  # Define a simple MLP
     num_features: int
     hidden_size: int
     num_output: int
 
     @nn.compact
     def __call__(self, x):  # Forward pass
-        self.sow("intermediates", "in_0", x)    
-        x = nn.Dense(self.hidden_size)(x)   
+        self.sow("intermediates", "in_0", x)
+        x = nn.Dense(self.hidden_size)(x)
         x = nn.tanh(x)
         self.sow("intermediates", "in_1", x)
-        x = nn.Dense(self.hidden_size)(x)   
-        x = nn.tanh(x)  
+        x = nn.Dense(self.hidden_size)(x)
+        x = nn.tanh(x)
         self.sow("intermediates", "in_2", x)
         x = nn.Dense(self.num_output)(x)
         return x
@@ -40,11 +40,9 @@ def create_train_state(rng, model, optimizer):
 
     return train_state.TrainState.create(apply_fn=apply_fn, params=params, tx=optimizer)
 
-    # Loss function
-
 
 @jax.jit
-def compute_loss(logits, labels):  
+def compute_loss(logits, labels):
     labels = jnp.asarray(labels, dtype=jnp.int32)  # Ensure labels are int32
     return jnp.sum(optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=labels))
 
