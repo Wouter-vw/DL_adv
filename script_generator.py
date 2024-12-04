@@ -40,7 +40,6 @@ with open("run_banana_experiments.sh", "w") as f:
             f"--linearized_pred {lin} "
             f"--kfac {kfac} "
             f"--diffrax {diffrax} "
-            f"--savefig {savefig}"
             f"--epochs {epochs}"
         )
         f.write(cmd + "\n")
