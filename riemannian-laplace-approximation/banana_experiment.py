@@ -94,6 +94,13 @@ def main(args):
 
     batch_data = args.batch_data
 
+    # Save the plots if the flag is set
+    if args.savefig:
+        savepath = f"plots_seed_{args.seed}_linearized_{args.linearized_pred}_samples_{args.samples}_optimize_prior_{args.optimize_prior}_orig"
+        ## Create a folder to save the plots
+        if not os.path.exists(savepath):
+            os.makedirs(savepath)
+
     # run with several seeds
     seed = args.seed
     np.random.seed(seed)
@@ -123,7 +130,7 @@ def main(args):
     plt.xticks([], [])
     plt.yticks([], [])
     plt.title("Train")
-    plt.show()
+    plt.savefig(f"{savepath}/train.pdf")
 
     print("Some info about the dataset:")
     print(f"Train: {x_train.shape, y_train.shape}")
@@ -237,8 +244,7 @@ def main(args):
     plt.title("Confidence MAP")
     plt.xticks([], [])
     plt.yticks([], [])
-    # plt.savefig('banana_plots_classic/MAP.pdf')
-    plt.show()
+    plt.savefig(f"{savepath}/MAP.pdf")
 
     ####### Laplace approximation #####################################################################################################
     start = time.time()
@@ -681,7 +687,7 @@ def main(args):
         plt.xticks([], [])
         plt.yticks([], [])
         plt.title("All weights, full Hessian approx - Confidence LA linearized")
-        plt.show()
+        plt.savefig(f"{savepath}/LAPLACE_lin.pdf")
 
         P_grid_OURS_lin /= n_posterior_samples
         P_grid_OUR_conf = P_grid_OURS_lin.max(1)
@@ -721,7 +727,7 @@ def main(args):
         plt.xticks([], [])
         plt.yticks([], [])
         plt.title("All weights, full Hessian approx - Confidence OUR linearized")
-        plt.show()
+        plt.savefig(f"{savepath}/OURS_lin.pdf")
 
         # plt.contourf(XX1, XX2, P_grid_LAPLACE_conf.reshape(N_grid, N_grid), alpha=0.8, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
         # # plt.colorbar()
@@ -825,7 +831,7 @@ def main(args):
         plt.title("All weights, full Hessian approx - Confidence LA")
         plt.xticks([], [])
         plt.yticks([], [])
-        plt.show()
+        plt.savefig(f"{savepath}/LAPLACE.pdf")
 
         # and then our stuff
         P_grid_OUR = 0
@@ -873,7 +879,7 @@ def main(args):
         plt.title("All weights, full Hessian approx - Confidence OURS")
         plt.xticks([], [])
         plt.yticks([], [])
-        plt.show()
+        plt.savefig(f"{savepath}/OURS.pdf")
 
         # plt.contourf(XX1, XX2, P_grid_LAPLACE_conf.reshape(N_grid, N_grid), alpha=0.7, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
         # # plt.colorbar()
