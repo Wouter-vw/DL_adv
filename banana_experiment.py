@@ -47,6 +47,7 @@ def write_results_to_csv(flags, metrics, time_dict, output_file="banana_results.
         "kfac",
         "diffrax",
         "savefig",
+        "epochs",
         "accuracy_MAP",
         "nll_MAP",
         "brier_MAP",
@@ -146,7 +147,7 @@ def main(args):
     if args.savefig:
         savepath = f"plots_seed_{args.seed}_linearized_{args.linearized_pred}_samples_{args.samples}_optimize_prior_{args.optimize_prior}_diffrax_{args.diffrax}"
         ## Create a folder to save the plots
-        if not os.path.exists("plots"):
+        if not os.path.exists(savepath):
             os.makedirs(savepath)
 
     # Load the banana dataset
@@ -615,6 +616,7 @@ def main(args):
         "kfac": args.kfac,
         "diffrax": args.diffrax,
         "savefig": args.savefig,
+        "epochs": args.epochs,
     }
 
     metrics = {

@@ -32,16 +32,19 @@ with open("run_banana_experiments.sh", "w") as f:
 
     for combo in combinations:
         seed, opt_prior, samp, lin, kfac, diffrax, epochs, savefig = combo
-        cmd = (
-            f"python banana_experiment.py "
-            f"--seed {seed} "
-            f"--optimize_prior {opt_prior} "
-            f"--samples {samp} "
-            f"--linearized_pred {lin} "
-            f"--kfac {kfac} "
-            f"--diffrax {diffrax} "
-            f"--epochs {epochs}"
-        )
+        # Construct the command
+        # boolean flags
+        opt_prior = "--optimize_prior True" if opt_prior else ""
+        lin = "--linearized_pred True" if lin else ""
+        kfac = "--kfac True" if kfac else ""
+        diffrax = "--diffrax True" if diffrax else ""
+        savefig = "--savefig True"
+        # integer flags
+        seed = f"--seed {seed}"
+        samp = f"--samples {samp}"
+        epochs = f"--epochs {epochs}"
+        # Construct the command
+        cmd = f"python banana_experiment.py {seed} {opt_prior} {samp} {lin} {kfac} {diffrax} {epochs} {savefig}"
         f.write(cmd + "\n")
 
 print("Shell script 'run_banana_experiments.sh' generated successfully.")
