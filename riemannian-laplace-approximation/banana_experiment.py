@@ -58,7 +58,7 @@ def write_results_to_csv(flags, metrics, time_dict, output_file="banana_results_
         "ece_LA",
         "mce_LA",
         "Total_time",
-        "Exmap_time",
+        "Expmap_time",
         "Laplace_time",
         "NetworkTraining_time",
     ]
@@ -75,7 +75,7 @@ def write_results_to_csv(flags, metrics, time_dict, output_file="banana_results_
             **flags,
             **metrics,
             "Total_time": time_dict.get("Total", None),
-            "Exmap_time": time_dict.get("Exmap", None),
+            "Expmap_time": time_dict.get("Expmap_time", None),
             "Laplace_time": time_dict.get("Laplace", None),
             "NetworkTraining_time": time_dict.get("NetworkTraining", None),
         }
@@ -514,7 +514,8 @@ def main(args):
             # laplace_weigths = torch.cat((feature_extractor_MAP.clone().view(-1), laplace_weigths.view(-1)), dim=0)
             weights_LA[n, :] = laplace_weigths.cpu()
 
-    time_dict["Expmap"] = time.time() - start
+    time_dict["Expmap_time"] = time.time() - start
+    print("expmap_time)",time_dict)
 
     # now I can use my weights for prediction. Deoending if I am using linearization or not the prediction looks differently
     if args.linearized_pred:

@@ -2,3 +2,4 @@
 __pycache__/
 riemannian-laplace-approximation/plots/
 *.sh
+plots/
