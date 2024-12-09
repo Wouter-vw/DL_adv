@@ -10,8 +10,8 @@ samples = [100]
 seeds = random.sample(range(1, 1000), 10)
 linearized_pred = [True, False]
 optimize_prior = [True, False]
-epochs = [1500, 2000, 2500]
-savefig = [False]
+epochs = [1500, 2000, 2500, 3000]
+savefig = [True]
 
 # Generate all combinations
 combinations = itertools.product(

@@ -145,10 +145,10 @@ def main(args):
 
     # Save the plots if the flag is set
     if args.savefig:
-        savepath = f"plots_seed_{args.seed}_linearized_{args.linearized_pred}_samples_{args.samples}_optimize_prior_{args.optimize_prior}_diffrax_{args.diffrax}"
+        savepath = f"plots_seed_{args.seed}_linearized_{args.linearized_pred}_samples_{args.samples}_optimize_prior_{args.optimize_prior}_diffrax_{args.diffrax}_kfac_{args.kfac}_epochs_{args.epochs}"
         ## Create a folder to save the plots
-        if not os.path.exists(savepath):
-            os.makedirs(savepath)
+        if not os.path.exists(f"plots/{savepath}"):
+            os.makedirs(f"plots/{savepath}")
 
     # Load the banana dataset
     x_train, x_valid, x_test, y_train, y_valid, y_test = load_banana_data()
@@ -231,7 +231,7 @@ def main(args):
 
     # Save the plots if the flag is set, else display the plots
     if args.savefig:
-        plot_map_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, conf, title="Confidence MAP", save_path=f"{savepath}/MAP.pdf")
+        plot_map_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, conf, title="Confidence MAP", save_path=f"plots/{savepath}/MAP.pdf")
     else:
         plot_map_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, conf, title="Confidence MAP")
 
@@ -302,6 +302,7 @@ def main(args):
 
     if optimize_prior:
         lambda_reg = la.prior_precision.item() / 2
+    else:
         lambda_reg = weight_decay
 
     ####### Exmap #####################################################################################################
@@ -417,7 +418,7 @@ def main(args):
                 grid_posterior_confidence,
                 linearized_grid_posterior_probabilities[:, 0],
                 title="Confidence RIEM LA linearized",
-                save_path=f"{savepath}/RIEM_LA.pdf",
+                save_path=f"plots/{savepath}/RIEM_LA.pdf",
             )
         else:  # Display the plots
             plot_confidence(
@@ -450,7 +451,7 @@ def main(args):
         P_grid_laplace_conf = P_grid_laplace_lin.max(1)
 
         if args.savefig:  # Save the plots if the flag is set
-            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, P_grid_laplace_conf, P_grid_laplace_lin[:, 0], title="Confidence LAPLACE linearized", save_path=f"{savepath}/LA.pdf")
+            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, P_grid_laplace_conf, P_grid_laplace_lin[:, 0], title="Confidence LAPLACE linearized", save_path=f"plots/{savepath}/LA.pdf")
         else:  # Display the plots
             plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, P_grid_laplace_conf, P_grid_laplace_lin[:, 0], title="Confidence LAPLACE linearized")
 
@@ -494,7 +495,7 @@ def main(args):
         grid_posterior_confidence = grid_posterior_probabilities.max(1)  # Compute the confidence
 
         if args.savefig:  # Save the plots if the flag is set
-            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence, grid_posterior_probabilities[:, 0], title="Confidence RIEM LA", save_path=f"{savepath}/RIEM LA.pdf")
+            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence, grid_posterior_probabilities[:, 0], title="Confidence RIEM LA", save_path=f"plots/{savepath}/RIEM LA.pdf")
         else:  # Display the plots
             plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence, grid_posterior_probabilities[:, 0], title="Confidence RIEM LA")
 
@@ -516,7 +517,7 @@ def main(args):
         grid_posterior_probabilities_la /= n_posterior_samples
         grid_posterior_confidence_la = grid_posterior_probabilities_la.max(1)
         if args.savefig:  # Save the plots if the flag is set
-            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence_la, grid_posterior_probabilities_la[:, 0], title="Confidence LAPLACE", save_path=f"{savepath}/LA.pdf")
+            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence_la, grid_posterior_probabilities_la[:, 0], title="Confidence LAPLACE", save_path=f"plots/{savepath}/LA.pdf")
         else:  # Display the plots
             plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence_la, grid_posterior_probabilities_la[:, 0], title="Confidence LAPLACE")
 
