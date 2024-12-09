@@ -1,2 +1,4 @@
 .DS_Store
 __pycache__/
+riemannian-laplace-approximation/plots/
+*.sh

@@ -7,7 +7,8 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import sys
-import time
+import sklearn.model_selection
+import csv
 
 from laplace import Laplace
 import matplotlib.colors as colors
@@ -26,32 +27,36 @@ from torchmetrics.functional.classification import calibration_error
 from functorch import grad, jvp, make_functional, vjp, make_functional_with_buffers, hessian, jacfwd, jacrev, vmap
 from functorch_utils import get_params_structure, stack_gradient, custum_hvp, stack_gradient2
 import os
+import time
 
 
 def write_results_to_csv(flags, metrics, time_dict, output_file="banana_results_original.csv"):
     column_names = [
         "seed",
         "optimize_prior",
+        "batch_data",
+        "structure",
+        "subset",
         "samples",
         "linearized_pred",
-        "kfac",
-        "diffrax",
-        "savefig",
+        "expmap_different_batches",
+        "test_all",
+        "save_fig",
         "accuracy_MAP",
         "nll_MAP",
         "brier_MAP",
-        "ece_map",
-        "mce_map",
-        "accuracy_posterior",
-        "nll_posterior",
-        "brier_posterior",
-        "ece_posterior",
-        "mce_posterior",
-        "accuracy_laplace",
-        "nll_laplace",
-        "brier_laplace",
-        "ece_laplace",
-        "mce_laplace",
+        "ece_MAP",
+        "mce_MAP",
+        "accuracy_OURS",
+        "nll_OURS",
+        "brier_OURS",
+        "ece_OURS",
+        "mce_OURS",
+        "accuracy_LA",
+        "nll_LA",
+        "brier_LA",
+        "ece_LA",
+        "mce_LA",
         "Total_time",
         "Exmap_time",
         "Laplace_time",
@@ -98,8 +103,8 @@ def main(args):
     if args.savefig:
         savepath = f"plots_seed_{args.seed}_linearized_{args.linearized_pred}_samples_{args.samples}_optimize_prior_{args.optimize_prior}_orig"
         ## Create a folder to save the plots
-        if not os.path.exists(savepath):
-            os.makedirs(savepath)
+        if not os.path.exists(f'plots/{savepath}'):
+            os.makedirs(f'plots/{savepath}')
 
     # run with several seeds
     seed = args.seed
@@ -118,9 +123,12 @@ def main(args):
     split_train_size = 0.7
     strat = None
     x_full, y_full = np.concatenate((x_train, x_test)), np.concatenate((y_train, y_test))
-    x_train, x_test, y_train, y_test = sklearn.model_selection.train_test_split(x_full, y_full, train_size=split_train_size, random_state=230, shuffle=shuffle, stratify=strat)
-    x_test, x_valid, y_test, y_valid = sklearn.model_selection.train_test_split(x_test, y_test, train_size=0.5, random_state=230, shuffle=shuffle, stratify=strat)
-
+    x_train, x_test, y_train, y_test = sklearn.model_selection.train_test_split(
+        x_full, y_full, train_size=split_train_size, random_state=230, shuffle=shuffle, stratify=strat
+    )
+    x_test, x_valid, y_test, y_valid = sklearn.model_selection.train_test_split(
+        x_test, y_test, train_size=0.5, random_state=230, shuffle=shuffle, stratify=strat
+    )
     x_train = x_train[:265, :]
     y_train = y_train[:265]
 
@@ -130,7 +138,7 @@ def main(args):
     plt.xticks([], [])
     plt.yticks([], [])
     plt.title("Train")
-    plt.savefig(f"{savepath}/train.pdf")
+    plt.savefig(f"plots/{savepath}/train.pdf")
 
     print("Some info about the dataset:")
     print(f"Train: {x_train.shape, y_train.shape}")
@@ -244,7 +252,7 @@ def main(args):
     plt.title("Confidence MAP")
     plt.xticks([], [])
     plt.yticks([], [])
-    plt.savefig(f"{savepath}/MAP.pdf")
+    plt.savefig(f"plots/{savepath}/MAP.pdf")
 
     ####### Laplace approximation #####################################################################################################
     start = time.time()
@@ -687,7 +695,7 @@ def main(args):
         plt.xticks([], [])
         plt.yticks([], [])
         plt.title("All weights, full Hessian approx - Confidence LA linearized")
-        plt.savefig(f"{savepath}/LAPLACE_lin.pdf")
+        plt.savefig(f"plots/{savepath}/LAPLACE_lin.pdf")
 
         P_grid_OURS_lin /= n_posterior_samples
         P_grid_OUR_conf = P_grid_OURS_lin.max(1)
@@ -727,7 +735,7 @@ def main(args):
         plt.xticks([], [])
         plt.yticks([], [])
         plt.title("All weights, full Hessian approx - Confidence OUR linearized")
-        plt.savefig(f"{savepath}/OURS_lin.pdf")
+        plt.savefig(f"plots/{savepath}/OURS_lin.pdf")
 
         # plt.contourf(XX1, XX2, P_grid_LAPLACE_conf.reshape(N_grid, N_grid), alpha=0.8, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
         # # plt.colorbar()
@@ -831,7 +839,7 @@ def main(args):
         plt.title("All weights, full Hessian approx - Confidence LA")
         plt.xticks([], [])
         plt.yticks([], [])
-        plt.savefig(f"{savepath}/LAPLACE.pdf")
+        plt.savefig(f"plots/{savepath}/LAPLACE.pdf")
 
         # and then our stuff
         P_grid_OUR = 0
@@ -879,7 +887,7 @@ def main(args):
         plt.title("All weights, full Hessian approx - Confidence OURS")
         plt.xticks([], [])
         plt.yticks([], [])
-        plt.savefig(f"{savepath}/OURS.pdf")
+        plt.savefig(f"plots/{savepath}/OURS.pdf")
 
         # plt.contourf(XX1, XX2, P_grid_LAPLACE_conf.reshape(N_grid, N_grid), alpha=0.7, antialiased=True, cmap='Blues', levels=np.arange(0., 1.01, 0.1))
         # # plt.colorbar()
@@ -966,7 +974,6 @@ def main(args):
 
     flags = {
         "seed": seed,
-        "optimizer": optimizer,
         "optimize_prior": optimize_prior,
         "batch_data": batch_data,
         "structure": hessian_structure,
@@ -975,6 +982,7 @@ def main(args):
         "linearized_pred": args.linearized_pred,
         "expmap_different_batches": args.expmap_different_batches,
         "test_all": args.test_all,
+        "save_fig": args.savefig,
     }
 
     metrics = {
@@ -1023,6 +1031,13 @@ if __name__ == "__main__":
         type=bool,
         default=False,
         help="Use also the validation set that we are not using for evaluation",
+    )
+    parser.add_argument(
+        "--savefig",
+        "-savefig",
+        type=bool,
+        default=False,
+        help="whether to save figure",
     )
 
     args = parser.parse_args()
