@@ -21,7 +21,7 @@ def first_order_odes(manifold, state):
 
 # Initiate the ODE Solver
 @partial(jax.jit, static_argnums=(0,1))
-def solve_with_solver(manifold, solver, x, v):
+def solve_with_solver(manifold, solver, x, v, pcoeff, icoeff):
     x = x.reshape(-1, 1)
     v = v.reshape(-1, 1)
     init = jnp.concatenate((x, v), axis=0).flatten()
@@ -38,7 +38,7 @@ def solve_with_solver(manifold, solver, x, v):
         dt0=0.2,
         y0=init,
         saveat=diffrax.SaveAt(t1=True),
-        stepsize_controller=diffrax.PIDController(pcoeff=0.0, icoeff=1.0, dcoeff=0.0, rtol=1e-6, atol=1e-3)
+        stepsize_controller=diffrax.PIDController(pcoeff=pcoeff, icoeff=icoeff, dcoeff=0.0, rtol=1e-6, atol=1e-3)
     )
     return sol
 
@@ -52,18 +52,30 @@ def return_sol(sol):
     return curve, velocity
 
 # Solving the exponential map. Change solver when fail, if fail again return init
-def expmap(manifold, x, v):
+def expmap(manifold, x, v, solver='dopri5', pcoeff=0.2, icoeff=0.4):
+    if solver == 'dopri5':
+        solver_ = diffrax.Dopri5()
+    elif solver == 'tsit5':
+        solver_ = diffrax.Tsit5()
+    elif solver == 'bosh3':
+        solver_ = diffrax.Bosh3()
+    else:
+        raise ValueError("Invalid solver.")
     try:
-        sol = solve_with_solver(manifold, diffrax.Tsit5(), x, v)
+        sol = solve_with_solver(manifold, solver_, x, v, 
+                                pcoeff=pcoeff, icoeff=icoeff)
         failed = False
     except Exception as e:
-        print("Solver failed with Tsit5, trying Dopri8")
+        print(f"Solver failed with {solver}, trying Dopri8")
         try:
-            sol = solve_with_solver(manifold, diffrax.Dopri8(), x, v)
+            sol = solve_with_solver(manifold, diffrax.Dopri8(), x, v,
+                                    pcoeff=pcoeff, icoeff=icoeff)
+            solver = 'dopri8'
             failed = False
         except Exception as e:
             print("Solver failed with Dopri8 as well, returning init")
+            solver = False
             failed = True
             return x, v, failed
     curve, velocity = return_sol(sol)
-    return curve, velocity, failed
+    return curve, velocity, failed, solver

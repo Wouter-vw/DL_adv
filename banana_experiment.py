@@ -46,6 +46,9 @@ def write_results_to_csv(flags, metrics, time_dict, output_file="banana_results.
         "linearized_pred",
         "kfac",
         "diffrax",
+        "solver",
+        "pcoeff",
+        "icoeff",
         "savefig",
         "epochs",
         "accuracy_MAP",
@@ -129,7 +132,7 @@ def main(args):
     total_start = time.time()
     # Print the input flags
     print(
-        f"Input Flags: Seed: {args.seed}, Linearization? {args.linearized_pred}, # Posterior Samples: {args.samples}, Prior Optimization? {args.optimize_prior}, KFAC? {args.kfac}, Diffrax? {args.diffrax}, Epochs: {args.epochs}"
+        f"Input Flags: Seed: {args.seed}, Linearization? {args.linearized_pred}, # Posterior Samples: {args.samples}, Prior Optimization? {args.optimize_prior}, KFAC? {args.kfac}, Diffrax? {args.diffrax}, Solver: {args.solver}, pcoeff: {args.pcoeff}, icoeff: {args.icoeff}, Epochs: {args.epochs}"
     )
     n_posterior_samples = args.samples
     optimize_prior = args.optimize_prior
@@ -145,10 +148,10 @@ def main(args):
 
     # Save the plots if the flag is set
     if args.savefig:
-        savepath = f"plots_seed_{args.seed}_linearized_{args.linearized_pred}_samples_{args.samples}_optimize_prior_{args.optimize_prior}_diffrax_{args.diffrax}"
+        savepath = f"plots_seed_{args.seed}_linearized_{args.linearized_pred}_samples_{args.samples}_optimize_prior_{args.optimize_prior}_diffrax_{args.diffrax}_pcoeff_{args.pcoeff}_icoeff_{args.icoeff}_kfac_{args.kfac}_epochs_{args.epochs}"
         ## Create a folder to save the plots
-        if not os.path.exists(savepath):
-            os.makedirs(savepath)
+        if not os.path.exists(f"plots/{savepath}"):
+            os.makedirs(f"plots/{savepath}")
 
     # Load the banana dataset
     x_train, x_valid, x_test, y_train, y_valid, y_test = load_banana_data()
@@ -231,7 +234,7 @@ def main(args):
 
     # Save the plots if the flag is set, else display the plots
     if args.savefig:
-        plot_map_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, conf, title="Confidence MAP", save_path=f"{savepath}/MAP.pdf")
+        plot_map_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, conf, title="Confidence MAP", save_path=f"plots/{savepath}/MAP.pdf")
     else:
         plot_map_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, conf, title="Confidence MAP")
 
@@ -302,6 +305,7 @@ def main(args):
 
     if optimize_prior:
         lambda_reg = la.prior_precision.item() / 2
+    else:
         lambda_reg = weight_decay
 
     ####### Exmap #####################################################################################################
@@ -364,7 +368,7 @@ def main(args):
         v = velocity_samples_laplace[n, :].reshape(-1, 1)  # Reshape the velocity samples
         # Solve the expmap using the diffrax solver if the flag is set, else use the standard scipy solver
         if args.diffrax:
-            final_c, _, failed = geometry_diffrax.expmap(manifold, map_solution.clone(), v)
+            final_c, _, failed, solver = geometry_diffrax.expmap(manifold, map_solution.clone(), v, args.solver, args.pcoeff, args.icoeff)
             _new_weights = final_c
         else:
             curve, failed = geometry.expmap(manifold, map_solution.clone(), v)
@@ -417,7 +421,7 @@ def main(args):
                 grid_posterior_confidence,
                 linearized_grid_posterior_probabilities[:, 0],
                 title="Confidence RIEM LA linearized",
-                save_path=f"{savepath}/RIEM_LA.pdf",
+                save_path=f"plots/{savepath}/RIEM_LA.pdf",
             )
         else:  # Display the plots
             plot_confidence(
@@ -450,7 +454,7 @@ def main(args):
         P_grid_laplace_conf = P_grid_laplace_lin.max(1)
 
         if args.savefig:  # Save the plots if the flag is set
-            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, P_grid_laplace_conf, P_grid_laplace_lin[:, 0], title="Confidence LAPLACE linearized", save_path=f"{savepath}/LA.pdf")
+            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, P_grid_laplace_conf, P_grid_laplace_lin[:, 0], title="Confidence LAPLACE linearized", save_path=f"plots/{savepath}/LA.pdf")
         else:  # Display the plots
             plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, P_grid_laplace_conf, P_grid_laplace_lin[:, 0], title="Confidence LAPLACE linearized")
 
@@ -494,7 +498,7 @@ def main(args):
         grid_posterior_confidence = grid_posterior_probabilities.max(1)  # Compute the confidence
 
         if args.savefig:  # Save the plots if the flag is set
-            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence, grid_posterior_probabilities[:, 0], title="Confidence RIEM LA", save_path=f"{savepath}/RIEM LA.pdf")
+            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence, grid_posterior_probabilities[:, 0], title="Confidence RIEM LA", save_path=f"plots/{savepath}/RIEM LA.pdf")
         else:  # Display the plots
             plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence, grid_posterior_probabilities[:, 0], title="Confidence RIEM LA")
 
@@ -516,7 +520,7 @@ def main(args):
         grid_posterior_probabilities_la /= n_posterior_samples
         grid_posterior_confidence_la = grid_posterior_probabilities_la.max(1)
         if args.savefig:  # Save the plots if the flag is set
-            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence_la, grid_posterior_probabilities_la[:, 0], title="Confidence LAPLACE", save_path=f"{savepath}/LA.pdf")
+            plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence_la, grid_posterior_probabilities_la[:, 0], title="Confidence LAPLACE", save_path=f"plots/{savepath}/LA.pdf")
         else:  # Display the plots
             plot_confidence(x_train, y_train, grid_mesh_x, grid_mesh_y, grid_posterior_confidence_la, grid_posterior_probabilities_la[:, 0], title="Confidence LAPLACE")
 
@@ -615,6 +619,9 @@ def main(args):
         "linearized_pred": args.linearized_pred,
         "kfac": args.kfac,
         "diffrax": args.diffrax,
+        "solver": solver,
+        "pcoeff": args.pcoeff,
+        "icoeff": args.icoeff,
         "savefig": args.savefig,
         "epochs": args.epochs,
     }
@@ -648,8 +655,21 @@ if __name__ == "__main__":
     parser.add_argument("--linearized_pred", "-lin", type=bool, default=False, help="Linearization")
     parser.add_argument("--kfac", "-kfac", type=bool, default=False, help="Use the KFAC approximation")
     parser.add_argument("--diffrax", "-diffrax", type=bool, default=False, help="Solve with diffrax instead of scipy")
+    parser.add_argument("--solver", "-solver", type=str, default='dopri5', help="Type of diffrax solver")
+    parser.add_argument("--pcoeff", "-pcoeff", type=float, default=0.2, help="pcoeff")
+    parser.add_argument("--icoeff", "-icoeff", type=float, default=0.4, help="icoeff")
     parser.add_argument("--savefig", "-savefig", type=bool, default=False, help="Whether figures should be saved")
     parser.add_argument("--epochs", "-epochs", type=int, default=2000, help="Number of epochs")
 
     args = parser.parse_args()  # Arguments
-    main(args)
+    
+    args.pcoeff = 0.2
+    args.icoeff = 0.3
+
+    for solver in ['dopri5', 'tsit5', 'bosh3']:
+        for seed in np.linspace(0, 9, 10).astype(int):
+            args.solver = solver
+            args.seed = seed
+            main(args)
+
+            
