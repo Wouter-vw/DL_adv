@@ -21,7 +21,7 @@ chmod +x run_banana_experiments.sh
 # Running the trials
 ./run_banana_experiments.sh
 ```
-In order to have batter comparison, the slowest setup has been used, namely with unoptimized priors, unlinearized methods and without KFAC. The epochs fixed at 2000 and 100 posterior samples are always used. 
+To have a better comparison, the slowest setup has been used, namely with unoptimized priors, unlinearized methods and without KFAC. The epochs fixed at 2000 and 100 posterior samples are always used. 
 
 > Note: Running the script to reproduce the comparison will take on average 5/6 min per command line in run_banana_experiments.sh.
 ## Single runs
