@@ -1,0 +1,388 @@
+---
+title: "DL_Project_analysis"
+output: html_document
+date: '2024-12-09'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(lme4)
+library(sjPlot)
+library(sjmisc)
+library(hrbrthemes)
+library(lmerTest)
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggsci)
+library(purrr)
+library(broom)
+library(patchwork)
+
+# theme_set(theme_sjplot())
+theme_set(theme_ipsum())
+```
+
+```{r}
+data_path <- '/Users/timotheusberg/Documents/COSSE/Year 2 - Stockholm/DL/Project/DL_adv/analysis/data'
+data_jax <- read_csv(paste(data_path, 'banana_results_3000.csv', sep='/'))
+data_orig <- read_csv(paste(data_path, 'banana_results_original.csv', sep='/'))
+
+
+# Process the tensor rows in the original data
+# tensor(1.234) -> 1.234
+cols <- c("ece_MAP", "mce_MAP", "ece_OURS", "mce_OURS", "ece_LA", "mce_LA")
+
+data_orig <-data_orig %>%
+  mutate_at(cols, funs(str_replace_all(., 'tensor\\((.*)\\)', '\\1'))) %>%
+  mutate_at(cols, funs(as.numeric(.)))
+
+# Scale calibration metrics
+data_orig$ece_MAP <- data_orig$ece_MAP / 100
+data_orig$mce_MAP <- data_orig$mce_MAP / 100
+data_orig$ece_OURS <- data_orig$ece_OURS / 100
+data_orig$mce_OURS <- data_orig$mce_OURS / 100
+data_orig$ece_LA <- data_orig$ece_LA / 100
+data_orig$mce_LA <- data_orig$mce_LA / 100
+data_jax$ece_map <- data_jax$ece_map / 100
+data_jax$mce_map <- data_jax$mce_map / 100
+data_jax$ece_laplace <- data_jax$ece_laplace / 100
+data_jax$mce_laplace <- data_jax$mce_laplace / 100
+data_jax$ece_posterior <- data_jax$ece_posterior / 100
+data_jax$mce_posterior <- data_jax$mce_posterior / 100
+
+# Rename the columns with OURS to posterior
+data_orig <- data_orig %>%
+  rename(ece_posterior = ece_OURS, mce_posterior = mce_OURS, nll_posterior = nll_OURS, brier_posterior = brier_OURS, accuracy_posterior = accuracy_OURS)
+
+# Rename the columns with LA to laplace
+data_orig <- data_orig %>%
+  rename(ece_laplace = ece_LA, mce_laplace = mce_LA, nll_laplace = nll_LA, brier_laplace = brier_LA, accuracy_laplace = accuracy_LA, Exmap_time = Expmap_time)
+
+data_jax <- data_jax %>%
+  rename(ece_MAP = ece_map, mce_MAP = mce_map)
+
+data_jax$epochs_500 <- data_jax$epochs / 500
+
+```
+
+```{r}
+# Fuse data together with the code column, keeping the following columns:
+# Control variables: linearized_pred, optimize_prior, seed
+# Dependent time variables: Exmap_time, Total_time, NetworkTraining_time, Laplace_time
+# Dependent score varibales: accuracy_MAP, ece_map, mce_map, nll_MAP, brier_MAP,
+# accuracy_laplace, ece_laplace, mce_laplace, nll_laplace, brier_laplace,
+# accuracy_posterior, ece_posterior, mce_posterior, nll_posterior, brier_posterior
+
+data_jax_fuse <- data_jax %>% filter(epochs == 2500) %>% filter(kfac == FALSE) %>%
+  mutate(code = 'jax') %>%
+  select(code, linearized_pred, optimize_prior, seed, Exmap_time, Total_time, NetworkTraining_time, Laplace_time, accuracy_MAP, ece_MAP, mce_MAP, nll_MAP, brier_MAP, accuracy_laplace, ece_laplace, mce_laplace, nll_laplace, brier_laplace, accuracy_posterior, ece_posterior, mce_posterior, nll_posterior, brier_posterior)
+
+data_orig_fuse <- data_orig %>%
+  mutate(code = 'original') %>%
+  select(code, linearized_pred, optimize_prior, seed, Exmap_time, Total_time, NetworkTraining_time, Laplace_time, accuracy_MAP, ece_MAP, mce_MAP, nll_MAP, brier_MAP, accuracy_laplace, ece_laplace, mce_laplace, nll_laplace, brier_laplace, accuracy_posterior, ece_posterior, mce_posterior, nll_posterior, brier_posterior)
+
+data_fuse <- bind_rows(data_jax_fuse, data_orig_fuse)
+
+data_fuse$code <- factor(data_fuse$code, levels = c('original','jax'))
+```
+
+
+```{r}
+# Time models
+time_model_total <- lm(Total_time ~ code + linearized_pred + optimize_prior, data = data_fuse)
+time_model_network <- lm(NetworkTraining_time ~ code, data = data_fuse)
+time_model_exmap <- lm(Exmap_time ~ code + optimize_prior + linearized_pred, data = data_fuse)
+time_model_exmap_jax <- lm(Exmap_time ~ kfac + diffrax + linearized_pred + optimize_prior, data = data_jax)
+
+# Measurement models
+map_scores <- c('accuracy_MAP', 'ece_MAP', 'mce_MAP', 'nll_MAP', 'brier_MAP')
+posterior_scores <- c('accuracy_posterior', 'ece_posterior', 'mce_posterior', 'nll_posterior', 'brier_posterior')
+
+map_models <- map_scores %>% map(~lm(paste(.x, '~ code', sep=''), data = data_fuse))
+posterior_models <- posterior_scores %>% map(~lm(paste(.x, '~ code + optimize_prior + linearized_pred', sep=''), data = data_fuse))
+
+posterior_jax_models <- posterior_scores %>% map(~lm(paste(.x, '~ kfac + epochs_500 + optimize_prior + linearized_pred', sep=''), data = data_jax))
+```
+
+## Analysis
+
+```{r}
+summary(time_model_total)
+summary(time_model_network)
+summary(time_model_exmap)
+summary(time_model_exmap_jax)
+
+plot_model(time_model_total)
+plot_model(time_model_network)
+plot_model(time_model_exmap)
+plot_model(time_model_exmap_jax)
+```
+```{r}
+jax_ideal_time <- data_jax %>% filter(kfac == TRUE) %>% filter(epochs == 2500) %>% 
+                    select(Total_time, linearized_pred, optimize_prior) %>%
+                    mutate(code = 'jax')
+data_orig_fuse_time <- data_orig_fuse %>% select(Total_time, linearized_pred, optimize_prior) %>% 
+                    mutate(code = 'original')
+
+data_fuse_time <- bind_rows(jax_ideal_time, data_orig_fuse_time)
+
+data_fuse_time$code <- factor(data_fuse_time$code, levels = c('original','jax'))
+
+time_model_total_fuse <- lm(Total_time ~ code + linearized_pred + optimize_prior, data = data_fuse_time)
+
+summary(time_model_total_fuse)
+plot_model(time_model_total_fuse)
+```
+```{r}
+# Get average total time speed for the jax implementation
+jax_ideal_time %>% filter(linearized_pred == FALSE) %>% filter(optimize_prior == TRUE) %>% summarise(mean(Total_time))
+jax_ideal_time %>% filter(linearized_pred == FALSE) %>% filter(optimize_prior == TRUE) %>% summarise(sd(Total_time))
+
+data_orig %>% filter(linearized_pred == FALSE) %>% filter(optimize_prior == TRUE) %>% summarise(mean(Total_time))
+data_orig %>% filter(linearized_pred == FALSE) %>% filter(optimize_prior == TRUE) %>% summarise(sd(Total_time))
+```
+
+
+```{r}
+map_models %>% map(summary)
+map_models %>% map(plot_model)
+```
+
+```{r}
+posterior_models %>% map(summary)
+posterior_models %>% map(plot_model)
+```
+
+```{r}
+# posterior jax
+posterior_jax_models %>% map(summary)
+posterior_jax_models %>% map(plot_model)
+```
+
+```{r,fig.height=5}
+dodge_width <- 0.75
+
+levels(data_fuse$code) <- c('Original', 'JAX')
+
+# Group 1: MCE, ECE, and Brier metrics
+grouped_metrics <- data_fuse %>%
+  select(code, mce_MAP, ece_MAP, brier_MAP, mce_posterior, ece_posterior, brier_posterior) %>%
+  pivot_longer(cols = -code, names_to = "metric", values_to = "value") %>%
+  mutate(type = ifelse(grepl("MAP", metric), "MAP", "RLA"),
+         metric = sub("_.*", "", metric))  # Keep only the metric name
+
+grouped_metrics <- grouped_metrics %>%
+  mutate(metric = case_when(
+    grepl("mce", metric) ~ "MCE",
+    grepl("ece", metric) ~ "ECE",
+    grepl("brier", metric) ~ "Brier"
+  ))
+
+# Plot Group 1
+plot_grouped_metrics_MAP <- grouped_metrics %>% filter(type == "MAP") %>% ggplot(., aes(x = code, y = value, fill = code)) +
+  geom_boxplot(alpha = 0.8, position = position_dodge(width = dodge_width)) +
+  facet_wrap(~metric) +
+  labs(title = "Calibration", subtitle = "MAP", x = "Code", y = "Value", fill = "Code") +
+  scale_fill_nejm() + 
+  theme_ipsum()
+
+plot_grouped_metrics_post <- grouped_metrics %>% filter(type == "Posterior") %>% ggplot(., aes(x = code, y = value, fill = code)) +
+  geom_boxplot(alpha = 0.8, position = position_dodge(width = dodge_width)) +
+  facet_wrap(~metric) +
+  labs(title = "Calibration", subtitle = "Posterior", x = "Code", y = "Value", fill = "Code") +
+  scale_fill_nejm() + 
+  theme_ipsum()
+
+# Group 2: NLL
+nll_data <- data_fuse %>%
+  select(code, nll_MAP, nll_posterior) %>%
+  pivot_longer(cols = -code, names_to = "type", values_to = "value") %>%
+  mutate(type = ifelse(grepl("MAP", type), "MAP", "RLA"))
+
+# Plot NLL
+plot_nll <- ggplot(nll_data, aes(x = code, y = value, fill = code)) +
+  geom_boxplot(alpha = 0.8, position = position_dodge(width = dodge_width)) +
+  labs(title = "Negative Log Likelihood", x = "Code", y = "NLL", fill = "Code") +
+  facet_wrap(~type) +
+  scale_fill_nejm() + 
+  # coord_fixed(ratio = 5) +
+  theme_ipsum()
+
+# Group 3: Accuracy
+accuracy_data <- data_fuse %>%
+  select(code, accuracy_MAP, accuracy_posterior) %>%
+  pivot_longer(cols = -code, names_to = "type", values_to = "value") %>%
+  mutate(type = ifelse(grepl("MAP", type), "MAP", "RLA"))
+
+# Plot Accuracy
+plot_accuracy <- ggplot(accuracy_data, aes(x = code, y = value, fill = code)) +
+  geom_boxplot(alpha = 0.8, position = position_dodge(width = dodge_width)) +
+  labs(title = "Accuracy", x = "Code", y = "Accuracy", fill = "Code") +
+  scale_fill_nejm() + 
+  facet_wrap(~type) +
+  # coord_fixed(ratio = 1) +
+  theme_ipsum()
+
+# Display the plots
+print(plot_grouped_metrics_MAP)
+print(plot_grouped_metrics_post)
+print(plot_nll)
+print(plot_accuracy)
+
+ggsave("plot_grouped_metrics_MAP.png", plot = plot_grouped_metrics_MAP, device = "png", dpi = 300)
+ggsave("plot_grouped_metrics_post.png", plot = plot_grouped_metrics_post, device = "png", dpi = 300)
+ggsave("plot_nll.png", plot = plot_nll, device = "png", dpi = 300)
+ggsave("plot_accuracy.png", plot = plot_accuracy, device = "png", dpi = 300)
+
+```
+
+```{r}
+# # Tidy the regression models
+# coef_data <- posterior_jax_models %>%
+#   map_dfr(~tidy(.x), .id = "model")  # Add model names as an identifier
+# 
+# # Clean up model names for better readability
+# coef_data <- coef_data %>%
+#   mutate(model = factor(model, labels = posterior_scores)) %>%
+#   mutate(term = factor(term, labels = c("Intercept", "500 Epochs", "KFAC", "Linearized Pred", "Optimize Prior"))) %>%
+#   mutate(model = case_when(
+#     grepl("accuracy", model) ~ "Accuracy",
+#     grepl("ece", model) ~ "ECE",
+#     grepl("mce", model) ~ "MCE",
+#     grepl("nll", model) ~ "NLL",
+#     grepl("brier", model) ~ "Brier"
+#   )) %>%
+#   filter(term != "Intercept")  # Remove the intercept
+# 
+# coef_data <- coef_data %>%
+#   mutate(estimate = case_when(
+#     grepl("Brier", model) ~ estimate * 100,
+#     TRUE ~ estimate
+#   ))
+# 
+# # Plot the coefficients
+# calibration_plot <- coef_data %>% filter(model %in% c("ECE", "MCE", "Brier")) %>% ggplot(., aes(x = model, y = estimate, fill = term)) +
+#   geom_bar(stat = "identity", position = position_dodge(width = 0.9), alpha = 0.8) +
+#   geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error),
+#                 position = position_dodge(width = 0.9), width = 0.2) +
+#   scale_fill_nejm() + 
+#   labs(title = "Calibration Coefficients",
+#        x = "Models",
+#        y = "Coefficient Estimate",
+#        fill = "Predictors") +
+#   theme_ipsum() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# 
+# nll_plot <- coef_data %>% filter(model == "NLL") %>% ggplot(., aes(x = term, y = estimate, fill = term)) +
+#   geom_bar(stat = "identity", position = position_dodge(width = 0.8), alpha = 0.8) +
+#   geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error),
+#                 position = position_dodge(width = 0.8), width = 0.2) +
+#   scale_fill_nejm() + 
+#   labs(title = "NLL Coefficients",
+#        x = "Predictors",
+#        y = "Coefficient Estimate",
+#        fill = "Predictors") +
+#   theme_ipsum() +
+#   coord_fixed(ratio = 10) +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# 
+# accuracy_plot <- coef_data %>% filter(model == "Accuracy") %>% ggplot(., aes(x = term, y = estimate, fill = term)) +
+#   geom_bar(stat = "identity", position = position_dodge(width = 0.8), alpha = 0.8) +
+#   geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error),
+#                 position = position_dodge(width = 0.8), width = 0.2) +
+#   scale_fill_nejm() + 
+#   labs(title = "Accuracy Coefficients",
+#        x = "Predictors",
+#        y = "Coefficient Estimate",
+#        fill = "Predictors") +
+#   theme_ipsum() +
+#   coord_fixed(ratio = 4) +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# 
+# print(calibration_plot)
+# print(nll_plot)
+# print(accuracy_plot)
+```
+
+
+
+
+```{r, fig.height=5}
+data_time <- data_fuse %>%
+  pivot_longer(cols = c(Total_time, NetworkTraining_time, Exmap_time),
+               names_to = "Time_Component",
+               values_to = "Time") %>%
+  mutate(Time_Component = factor(Time_Component,
+                                 levels = c("NetworkTraining_time", "Exmap_time", "Total_time"),
+                                 labels = c("Network", "Exmap", "Total")))
+
+runtime_reduction <- ggplot(data_time, aes(x = Time_Component, y = Time, fill = code)) +
+  geom_boxplot(alpha=0.8, position = position_dodge(width = dodge_width)) +
+  theme_ipsum() +
+  scale_fill_nejm() +
+  labs(title =  "Runtime Reduction", y = "Time (seconds)", x = "Components", fill = "Implementation")
+
+print(runtime_reduction)
+
+ggsave("runtime_reduction.png", plot = runtime_reduction, device = "png", dpi = 300)
+```
+
+
+```{r, fig.height=5}
+data_time_jax_exmap <- data_jax %>% filter(epochs == 2500) %>% select(Exmap_time, kfac, diffrax)
+
+
+# Update Exmap Jax Plot
+exmap_time_plot <- ggplot(data_time_jax_exmap, aes(x = kfac, y = Exmap_time, fill = diffrax)) +
+  geom_boxplot(alpha=0.8, position = position_dodge(width = dodge_width)) +
+  theme_ipsum() +
+  scale_fill_nejm() +
+  labs(title = "Exmap Time for JAX Implementation", x = "KFAC", y = "Time (seconds)", fill = "Diffrax")
+
+# ggsave("exmap_time_plot.png", plot = exmap_time_plot, device = "png", dpi = 300)
+print(exmap_time_plot)
+```
+
+
+
+
+```{r}
+# Solve analysis
+
+solver_data <- read_csv(paste(data_path, 'solvers_comparison(10seeds).csv', sep='/'))
+
+# Keep rows until 30
+solver_data <- solver_data[1:30,]
+solver_data$solver <- factor(solver_data$solver, levels = c('tsit5', 'dopri5', 'bosh3'))
+```
+
+```{r}
+solver_model <- lm(Exmap_time ~ solver, data = solver_data)
+
+summary(solver_model)
+```
+
+```{r}
+plot_model(solver_model)
+```
+
+```{r}
+# Metric analysis
+solver_models <- map(posterior_scores, ~lm(paste(.x, '~ solver'), data = solver_data))
+
+solver_models %>% map(summary)
+solver_models %>% map(plot_model)
+```
+
+```{r}
+# best accuracy score of th jax code
+best_idx <- which.max(data_jax$accuracy_posterior)
+data_jax[best_idx,]
+```
+
