@@ -1,2 +1,6 @@
 .DS_Store
 __pycache__/
+riemannian-laplace-approximation/plots/
+riemannian-laplace-approximation/*.sh
+JAX-RIEM-LA/banana_experiment.py.lprof
+JAX-RIEM-LA/*.sh
