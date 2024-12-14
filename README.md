@@ -8,5 +8,5 @@ The folder "JAX-RIEM-LA" houses our reimplementation code and a readme describin
 
 The folder "solver_comparison" contains the code required to compare various diffrax solvers to find the optimal settings for the relevant ODE.
 
-The folder "analysis" contains our analysis on the data files, which can be found in the folder itself, as well as in "JAX-RIEM-LA" and "riemannian-laplace-approximation". 
+The folder "analysis" contains our analysis on the data files, which can be found in the folder itself, as well as in "JAX-RIEM-LA" and "riemannian-laplace-approximation". The notebook can be opened and run with RStudio.
 
